@@ -46,7 +46,7 @@ ENV_FILE = ".env"
 HISTORY_FILE = ".thu-agent-history"
 CONFIG_DIR_NAME = ".thu-cybercraze-agent"
 MAX_HISTORY = 24
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 12
 MAX_TOOL_OUTPUT_CHARS = 12000
 RESPONSE_INDENT = 2
 PANEL_INDENT = 3
@@ -400,8 +400,10 @@ def _agent_system_prompt(cwd: str, runtime: dict[str, str]) -> str:
             "The snippet field is optional.\n",
             "When you need a command use:\n",
             '{"type":"run","reasoning":["short step","short step"],"command":"rg --files","reason":"list the repository files"}\n',
-            "When you need multiple commands at once use:\n",
-            '{"type":"run_many","reasoning":["short step","short step"],"commands":[{"command":"rg --files","reason":"list files"},{"command":"git status --short","reason":"check worktree"}],"reason":"gather context in parallel"}\n',
+            "When you need multiple commands in one tool round use:\n",
+            '{"type":"run_many","reasoning":["short step","short step"],"parallel":false,"commands":[{"command":"pwd","reason":"confirm current directory"},{"command":"rg --files","reason":"list files"}],"reason":"gather context in one batch"}\n',
+            "Set parallel=true only when the commands are independent and safe to run concurrently.\n",
+            "If a later command depends on an earlier command, use run_many with parallel=false.\n",
             "Keep reasoning short. Render user-facing explanations in markdown.",
         ]
     )
@@ -617,6 +619,25 @@ def _render_command_result(command: str, exit_code: int, output: str) -> None:
     )
 
 
+def _run_commands_sequential(command_items: list[dict[str, str]], cwd: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for index, item in enumerate(command_items):
+        result = _run_command(item["command"], cwd)
+        results.append(
+            {
+                "index": index,
+                "command": item["command"],
+                "reason": item["reason"],
+                "exit_code": result["exit_code"],
+                "output": result["output"],
+                "interrupted": result.get("interrupted", False),
+            }
+        )
+        if result.get("interrupted"):
+            break
+    return results
+
+
 def _render_info(text: str) -> None:
     console.print(Padding(Text(text, style=f"dim {MUTED}"), (0, 0, 0, RESPONSE_INDENT)))
 
@@ -641,7 +662,7 @@ def _action_summary(action_type: str, reason: str, count: int | None = None) -> 
     if reason:
         return reason[:1].upper() + reason[1:]
     if action_type == "run_many":
-        return f"Running {count or 0} commands in parallel"
+        return f"Running {count or 0} commands"
     if action_type == "run":
         return "Running command"
     if action_type == "reply":
@@ -764,6 +785,13 @@ def _normalize_command_batch(action: dict[str, Any]) -> list[dict[str, str]]:
         if command:
             normalized.append({"command": command, "reason": reason})
     return normalized
+
+
+def _command_batch_parallel(action: dict[str, Any]) -> bool:
+    raw = action.get("parallel")
+    if isinstance(raw, bool):
+        return raw
+    return False
 
 
 def main() -> int:
@@ -909,22 +937,27 @@ def main() -> int:
 
                 if action_type == "run_many":
                     command_items = _normalize_command_batch(action)
+                    run_parallel = _command_batch_parallel(action)
                     if not command_items:
-                        console.print("empty parallel command request", style=ERROR)
+                        console.print("empty command batch request", style=ERROR)
                         break
                     _render_step(_action_summary("run_many", str(action.get("reason", "")).strip(), len(command_items)))
                     _render_command_batch(command_items, str(action.get("reason", "")).strip())
                     if not _prompt_run_command(always_run):
-                        tool_result = "Parallel command batch was not approved by the user."
+                        tool_result = "Command batch was not approved by the user."
                         _render_info(tool_result)
                     else:
-                        _render_step("Running Commands", f"{len(command_items)} in parallel")
+                        mode_label = "in parallel" if run_parallel else "sequentially"
+                        _render_step("Running Commands", f"{len(command_items)} {mode_label}")
                         try:
                             with console.status("[dim]running commands…[/dim]", spinner="dots"):
-                                results = _run_commands_parallel(command_items, cwd)
+                                if run_parallel:
+                                    results = _run_commands_parallel(command_items, cwd)
+                                else:
+                                    results = _run_commands_sequential(command_items, cwd)
                         except KeyboardInterrupt:
                             _render_step("Cancelled")
-                            _render_info("interrupted parallel command batch")
+                            _render_info("interrupted command batch")
                             break
                         _render_step("Command Results")
                         rendered_chunks: list[str] = []
@@ -941,6 +974,8 @@ def main() -> int:
                                     ]
                                 )
                             )
+                            if result.get("interrupted"):
+                                break
                         tool_result = "\n\n".join(rendered_chunks)
                     messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                     messages = _trim_history(messages)
@@ -981,7 +1016,11 @@ def main() -> int:
                 messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                 messages = _trim_history(messages)
             else:
-                console.print("stopped after too many tool rounds", style=ERROR)
+                _render_step("Stopped")
+                _render_info(
+                    f"stopped after {MAX_TOOL_ROUNDS} tool rounds. "
+                    "ask the agent to be more direct, or continue with a narrower follow-up."
+                )
         except Exception as exc:
             _render_step("Runtime Error")
             _render_error_snippet("runtime error", str(exc))
