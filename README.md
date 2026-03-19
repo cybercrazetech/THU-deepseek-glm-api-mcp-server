@@ -118,7 +118,12 @@ $env:THU_LAB_PROXY_API_KEY='your_proxy_key_here'
 $env:THU_LAB_PROXY_BASE_URL='https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1'
 ```
 
-You can also launch the agent and paste the key when prompted. The agent saves it into a local `.env` file for reuse.
+You can also launch the agent and paste the key when prompted. The agent saves it into a per-user global config file for reuse.
+
+Config location:
+
+- Linux and macOS: `~/.thu-cybercraze-agent/.env`
+- Windows: `%USERPROFILE%\.thu-cybercraze-agent\.env`
 
 ## Start the Agent
 
@@ -177,6 +182,8 @@ Slash commands available in the session:
 - `/pwd`
 - `/alwaysRun`
 - `/exit`
+
+While the agent is thinking or running a command, press `Ctrl+C` to cancel the current operation and return to the prompt without exiting the whole session.
 
 ## Typical Workflow
 

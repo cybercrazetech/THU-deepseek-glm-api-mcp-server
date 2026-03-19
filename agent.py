@@ -44,6 +44,7 @@ SUPPORTED_MODELS = [
 ]
 ENV_FILE = ".env"
 HISTORY_FILE = ".thu-agent-history"
+CONFIG_DIR_NAME = ".thu-cybercraze-agent"
 MAX_HISTORY = 24
 MAX_TOOL_ROUNDS = 6
 MAX_TOOL_OUTPUT_CHARS = 12000
@@ -109,8 +110,19 @@ def _api_key_env_var() -> str:
     return "THU_LAB_PROXY_API_KEY"
 
 
-def _load_env_file(cwd: str) -> dict[str, str]:
-    env_path = Path(cwd) / ENV_FILE
+def _global_config_dir() -> Path:
+    return Path.home() / CONFIG_DIR_NAME
+
+
+def _global_env_path() -> Path:
+    return _global_config_dir() / ENV_FILE
+
+
+def _global_history_path() -> Path:
+    return _global_config_dir() / HISTORY_FILE
+
+
+def _parse_env_file(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not env_path.exists():
         return values
@@ -130,9 +142,16 @@ def _load_env_file(cwd: str) -> dict[str, str]:
     return values
 
 
-def _save_api_key_to_env(cwd: str, api_key: str) -> None:
-    env_path = Path(cwd) / ENV_FILE
-    values = _load_env_file(cwd)
+def _load_env_file(cwd: str) -> dict[str, str]:
+    values = _parse_env_file(_global_env_path())
+    values.update(_parse_env_file(Path(cwd) / ENV_FILE))
+    return values
+
+
+def _save_api_key_to_env(api_key: str) -> None:
+    env_path = _global_env_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    values = _parse_env_file(env_path)
     values[_api_key_env_var()] = api_key
     if "THU_LAB_PROXY_BASE_URL" not in values:
         values["THU_LAB_PROXY_BASE_URL"] = DEFAULT_BASE_URL
@@ -140,9 +159,10 @@ def _save_api_key_to_env(cwd: str, api_key: str) -> None:
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _save_base_url_to_env(cwd: str, base_url: str) -> None:
-    env_path = Path(cwd) / ENV_FILE
-    values = _load_env_file(cwd)
+def _save_base_url_to_env(base_url: str) -> None:
+    env_path = _global_env_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    values = _parse_env_file(env_path)
     values["THU_LAB_PROXY_BASE_URL"] = base_url
     lines = [f"{key}='{value}'" for key, value in values.items()]
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -441,22 +461,43 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             cmd = ["powershell", "-NoProfile", "-Command", command]
         else:
             cmd = ["/bin/bash", "-lc", command]
-        completed = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=120)
-        output = (completed.stdout or "") + (completed.stderr or "")
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except KeyboardInterrupt:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            output = ((stdout or "") + (stderr or "")).strip()
+            if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
+            return {"exit_code": 130, "output": (output + "\nInterrupted by user.").strip(), "interrupted": True}
+        output = (stdout or "") + (stderr or "")
         if len(output) > MAX_TOOL_OUTPUT_CHARS:
             output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
-        return {"exit_code": completed.returncode, "output": output.strip()}
+        return {"exit_code": process.returncode, "output": output.strip(), "interrupted": False}
     except subprocess.TimeoutExpired:
-        return {"exit_code": 124, "output": "Command timed out after 120 seconds."}
+        return {"exit_code": 124, "output": "Command timed out after 120 seconds.", "interrupted": False}
     except FileNotFoundError as exc:
         return {
             "exit_code": 127,
             "output": f"Shell launch failed: {exc}",
+            "interrupted": False,
         }
     except OSError as exc:
         return {
             "exit_code": 127,
             "output": f"Command runner failed: {exc}",
+            "interrupted": False,
         }
 
 
@@ -641,7 +682,7 @@ def _print_help() -> None:
                         [
                             "## Commands",
                             "- `/help` show this help",
-                            "- `/model` show current model",
+                            "- `/model` reselect the model for this session",
                             "- `/key` replace the API key for this session",
                             "- `/pwd` show current working directory",
                             "- `/alwaysRun` toggle command approval prompts",
@@ -737,7 +778,8 @@ def main() -> int:
     cwd = str(Path(args.cwd).resolve())
     runtime = _detect_runtime()
     file_env = _load_env_file(cwd)
-    history_path = Path(cwd) / HISTORY_FILE
+    history_path = _global_history_path()
+    history_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_session = PromptSession(history=FileHistory(str(history_path)))
     default_model = (
         os.environ.get("THU_AGENT_MODEL")
@@ -758,8 +800,8 @@ def main() -> int:
     )
     base_url = _normalize_base_url(configured_base_url)
     api_key = args.api_key or _prompt_api_key(env_key)
-    _save_api_key_to_env(cwd, api_key)
-    _save_base_url_to_env(cwd, base_url)
+    _save_api_key_to_env(api_key)
+    _save_base_url_to_env(base_url)
     always_run = False
 
     messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
@@ -786,8 +828,14 @@ def main() -> int:
             continue
         if user_input == "/key":
             api_key = _prompt_api_key(None)
-            _save_api_key_to_env(cwd, api_key)
-            console.print(Padding(f"API key updated and saved to {ENV_FILE}.", (0, 0, 0, RESPONSE_INDENT)), style=SUCCESS)
+            _save_api_key_to_env(api_key)
+            console.print(
+                Padding(
+                    f"API key updated and saved to {_global_env_path()}.",
+                    (0, 0, 0, RESPONSE_INDENT),
+                ),
+                style=SUCCESS,
+            )
             continue
         if user_input == "/pwd":
             console.print(cwd, style=MUTED)
@@ -804,13 +852,20 @@ def main() -> int:
         try:
             for _ in range(MAX_TOOL_ROUNDS):
                 _render_step("Thinking")
-                with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                    response = _chat_completion(
-                        api_key=api_key,
-                        model=model,
-                        messages=messages,
-                        base_url=base_url,
-                    )
+                try:
+                    with console.status("[dim]thinking…[/dim]", spinner="dots"):
+                        response = _chat_completion(
+                            api_key=api_key,
+                            model=model,
+                            messages=messages,
+                            base_url=base_url,
+                        )
+                except KeyboardInterrupt:
+                    _render_step("Cancelled")
+                    _render_info("interrupted current model request")
+                    if messages and messages[-1].get("role") == "user":
+                        messages.pop()
+                    break
                 if not response["ok"]:
                     _render_step("Upstream Error")
                     console.print(Padding(f"upstream error: {response['error']}", (0, 0, 0, RESPONSE_INDENT)), style=ERROR)
@@ -821,8 +876,8 @@ def main() -> int:
                     if _is_invalid_api_key(str(response["error"]), response.get("status")):
                         _render_info("stored API key appears invalid or expired. enter a new key.")
                         api_key = _prompt_api_key(None)
-                        _save_api_key_to_env(cwd, api_key)
-                        _render_info(f"saved updated API key to {ENV_FILE}")
+                        _save_api_key_to_env(api_key)
+                        _render_info(f"saved updated API key to {_global_env_path()}")
                         continue
                     break
 
@@ -864,8 +919,13 @@ def main() -> int:
                         _render_info(tool_result)
                     else:
                         _render_step("Running Commands", f"{len(command_items)} in parallel")
-                        with console.status("[dim]running commands…[/dim]", spinner="dots"):
-                            results = _run_commands_parallel(command_items, cwd)
+                        try:
+                            with console.status("[dim]running commands…[/dim]", spinner="dots"):
+                                results = _run_commands_parallel(command_items, cwd)
+                        except KeyboardInterrupt:
+                            _render_step("Cancelled")
+                            _render_info("interrupted parallel command batch")
+                            break
                         _render_step("Command Results")
                         rendered_chunks: list[str] = []
                         for result in results:
@@ -913,6 +973,10 @@ def main() -> int:
                         f"Output:\n{result['output']}"
                     )
                     _render_command_result(command, result["exit_code"], result["output"])
+                    if result.get("interrupted"):
+                        _render_step("Cancelled")
+                        _render_info("interrupted current command")
+                        break
 
                 messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                 messages = _trim_history(messages)
