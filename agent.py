@@ -24,13 +24,23 @@ from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 
-DEFAULT_BASE_URL = "https://madmodel.cs.tsinghua.edu.cn/v1"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "DeepSeek-R1-Distill-32B"
+DEFAULT_BASE_URL = "https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1"
+DEFAULT_MODEL = "deepseek-v3.2"
 SUPPORTED_MODELS = [
-    "DeepSeek-R1-Distill-32B",
-    "DeepSeek-R1-671B",
-    "qwen/qwen3-coder:free",
+    "qwen3-max-thinking",
+    "qwen3-max",
+    "glm-5",
+    "glm-5-thinking",
+    "glm-4.7-thinking",
+    "kimi-k2.5",
+    "kimi-k2.5-thinking",
+    "minimax-m2.5",
+    "minimax-m2.5-thinking",
+    "qwen3.5-plus",
+    "qwen3.5-plus-thinking",
+    "qwen3.5-mini",
+    "deepseek-v3.2-thinking",
+    "deepseek-v3.2",
 ]
 ENV_FILE = ".env"
 HISTORY_FILE = ".thu-agent-history"
@@ -59,12 +69,17 @@ def _prompt(prompt: str, *, password: bool = False) -> str:
 
 
 def _prompt_model(default_model: str) -> str:
-    rows: list[str] = []
+    lines: list[Text] = [Text("Choose a Model", style=f"bold {ACCENT}")]
     for idx, model in enumerate(SUPPORTED_MODELS, start=1):
         default = " default" if model == default_model else ""
-        rows.append(f"{idx}. `{model}`{default}")
-    body = Markdown("## Choose a Model\n" + "\n".join(f"- {row}" for row in rows))
-    console.print(Panel(body, border_style=ACCENT, padding=(1, 2), title="Session"))
+        line = Text()
+        line.append("  •  ", style=ACCENT)
+        line.append(f"{idx:>2} ", style=ACCENT)
+        line.append(model, style="bold white")
+        if default:
+            line.append(default, style=f"italic {DIM}")
+        lines.append(line)
+    console.print(Panel(Group(*lines), border_style=ACCENT, padding=(1, 2), title="Session"))
     while True:
         raw = _prompt("> ").strip()
         if not raw:
@@ -90,22 +105,8 @@ def _prompt_api_key(existing: str | None) -> str:
         console.print("API key is required.", style=ERROR)
 
 
-def _provider_for_model(model: str) -> str:
-    if model.startswith("qwen/"):
-        return "openrouter"
-    return "tsinghua"
-
-
-def _base_url_for_model(model: str) -> str:
-    if _provider_for_model(model) == "openrouter":
-        return OPENROUTER_BASE_URL
-    return DEFAULT_BASE_URL
-
-
-def _api_key_env_var_for_model(model: str) -> str:
-    if _provider_for_model(model) == "openrouter":
-        return "OPENROUTER_API_KEY"
-    return "TSINGHUA_DEEPSEEK_API_KEY"
+def _api_key_env_var() -> str:
+    return "THU_LAB_PROXY_API_KEY"
 
 
 def _load_env_file(cwd: str) -> dict[str, str]:
@@ -129,25 +130,20 @@ def _load_env_file(cwd: str) -> dict[str, str]:
     return values
 
 
-def _save_api_key_to_env(cwd: str, api_key: str, model: str) -> None:
+def _save_api_key_to_env(cwd: str, api_key: str) -> None:
     env_path = Path(cwd) / ENV_FILE
     values = _load_env_file(cwd)
-    values[_api_key_env_var_for_model(model)] = api_key
-    if "TSINGHUA_DEEPSEEK_BASE_URL" not in values:
-        values["TSINGHUA_DEEPSEEK_BASE_URL"] = DEFAULT_BASE_URL
-    if "OPENROUTER_BASE_URL" not in values:
-        values["OPENROUTER_BASE_URL"] = OPENROUTER_BASE_URL
+    values[_api_key_env_var()] = api_key
+    if "THU_LAB_PROXY_BASE_URL" not in values:
+        values["THU_LAB_PROXY_BASE_URL"] = DEFAULT_BASE_URL
     lines = [f"{key}='{value}'" for key, value in values.items()]
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _save_base_url_to_env(cwd: str, base_url: str, model: str) -> None:
+def _save_base_url_to_env(cwd: str, base_url: str) -> None:
     env_path = Path(cwd) / ENV_FILE
     values = _load_env_file(cwd)
-    if _provider_for_model(model) == "openrouter":
-        values["OPENROUTER_BASE_URL"] = base_url
-    else:
-        values["TSINGHUA_DEEPSEEK_BASE_URL"] = base_url
+    values["THU_LAB_PROXY_BASE_URL"] = base_url
     lines = [f"{key}='{value}'" for key, value in values.items()]
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -176,15 +172,11 @@ def _detect_runtime() -> dict[str, str]:
         "shell": shell,
         "shell_label": shell_label,
     }
-def _headers(api_key: str, model: str) -> dict[str, str]:
-    headers = {
+def _headers(api_key: str) -> dict[str, str]:
+    return {
         "Content-Type": "application/json",
         "authorization": f"Bearer {api_key}",
     }
-    if _provider_for_model(model) == "openrouter":
-        headers["HTTP-Referer"] = "https://openrouter.ai/"
-        headers["X-Title"] = "THU Agent"
-    return headers
 
 
 def _extract_message(payload: dict[str, Any]) -> dict[str, Any]:
@@ -273,7 +265,7 @@ def _chat_completion(
     with httpx.Client(timeout=timeout, follow_redirects=False) as client:
         for attempt in range(max_retries + 1):
             try:
-                response = client.post(url, headers=_headers(api_key, model), json=body)
+                response = client.post(url, headers=_headers(api_key), json=body)
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
@@ -690,7 +682,7 @@ def _run_commands_parallel(command_items: list[dict[str, str]], cwd: str) -> lis
 
 def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
     header = Group(
-        Text("THU Agent", style=f"bold {ACCENT}"),
+        Text("THU CyberCraze Agent", style=f"bold {ACCENT}"),
         Text("interactive coding session", style=f"italic {DIM}"),
         Text(f"model  {model}", style=MUTED),
         Text(f"cwd    {cwd}", style=MUTED),
@@ -735,7 +727,7 @@ def _normalize_command_batch(action: dict[str, Any]) -> list[dict[str, str]]:
 
 def main() -> int:
     global prompt_session
-    parser = argparse.ArgumentParser(description="Interactive THU DeepSeek terminal agent")
+    parser = argparse.ArgumentParser(description="Interactive THU lab proxy terminal agent")
     parser.add_argument("--model", choices=SUPPORTED_MODELS, help="Model name")
     parser.add_argument("--api-key", help="API key for the current session")
     parser.add_argument("--base-url", help="API base URL")
@@ -749,39 +741,25 @@ def main() -> int:
     prompt_session = PromptSession(history=FileHistory(str(history_path)))
     default_model = (
         os.environ.get("THU_AGENT_MODEL")
-        or os.environ.get("TSINGHUA_DEEPSEEK_MODEL")
+        or os.environ.get("THU_LAB_PROXY_MODEL")
         or DEFAULT_MODEL
     )
     model = args.model or _prompt_model(default_model)
-    if _provider_for_model(model) == "openrouter":
-        configured_base_url = (
-            args.base_url
-            or os.environ.get("OPENROUTER_BASE_URL")
-            or file_env.get("OPENROUTER_BASE_URL")
-            or _base_url_for_model(model)
-        )
-        env_key = (
-            args.api_key
-            or os.environ.get("OPENROUTER_API_KEY")
-            or file_env.get("OPENROUTER_API_KEY")
-        )
-    else:
-        configured_base_url = (
-            args.base_url
-            or os.environ.get("TSINGHUA_DEEPSEEK_BASE_URL")
-            or file_env.get("TSINGHUA_DEEPSEEK_BASE_URL")
-            or _base_url_for_model(model)
-        )
-        env_key = (
-            args.api_key
-            or os.environ.get("TSINGHUA_DEEPSEEK_API_KEY")
-            or os.environ.get("DEEPSEEK_API_KEY")
-            or file_env.get("TSINGHUA_DEEPSEEK_API_KEY")
-        )
+    configured_base_url = (
+        args.base_url
+        or os.environ.get("THU_LAB_PROXY_BASE_URL")
+        or file_env.get("THU_LAB_PROXY_BASE_URL")
+        or DEFAULT_BASE_URL
+    )
+    env_key = (
+        args.api_key
+        or os.environ.get("THU_LAB_PROXY_API_KEY")
+        or file_env.get("THU_LAB_PROXY_API_KEY")
+    )
     base_url = _normalize_base_url(configured_base_url)
     api_key = args.api_key or _prompt_api_key(env_key)
-    _save_api_key_to_env(cwd, api_key, model)
-    _save_base_url_to_env(cwd, base_url, model)
+    _save_api_key_to_env(cwd, api_key)
+    _save_base_url_to_env(cwd, base_url)
     always_run = False
 
     messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
@@ -802,11 +780,13 @@ def main() -> int:
             _print_help()
             continue
         if user_input == "/model":
-            console.print(model, style=MUTED)
+            model = _prompt_model(model)
+            messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+            _render_info(f"model switched to {model}")
             continue
         if user_input == "/key":
             api_key = _prompt_api_key(None)
-            _save_api_key_to_env(cwd, api_key, model)
+            _save_api_key_to_env(cwd, api_key)
             console.print(Padding(f"API key updated and saved to {ENV_FILE}.", (0, 0, 0, RESPONSE_INDENT)), style=SUCCESS)
             continue
         if user_input == "/pwd":
@@ -836,12 +816,12 @@ def main() -> int:
                     console.print(Padding(f"upstream error: {response['error']}", (0, 0, 0, RESPONSE_INDENT)), style=ERROR)
                     if response.get("status") == 404:
                         _render_info(f"active base URL: {base_url}")
-                        _render_info("this endpoint worked earlier in the session, so this 404 is likely THU auth/session state changing rather than a bad URL.")
-                        _render_info("refresh the token, restart the agent, and retry.")
+                        _render_info("this 404 is coming from the upstream proxy, not from local command execution.")
+                        _render_info("check the selected model, retry later, or rotate the proxy key if access changed.")
                     if _is_invalid_api_key(str(response["error"]), response.get("status")):
                         _render_info("stored API key appears invalid or expired. enter a new key.")
                         api_key = _prompt_api_key(None)
-                        _save_api_key_to_env(cwd, api_key, model)
+                        _save_api_key_to_env(cwd, api_key)
                         _render_info(f"saved updated API key to {ENV_FILE}")
                         continue
                     break
