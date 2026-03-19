@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime as dt
 import getpass
 import json
 import os
@@ -15,6 +16,8 @@ from typing import Any
 
 import httpx
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import ConditionalCompleter, WordCompleter
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
 from rich.console import Console, Group
 from rich.markdown import Markdown
@@ -46,7 +49,6 @@ ENV_FILE = ".env"
 HISTORY_FILE = ".thu-agent-history"
 CONFIG_DIR_NAME = ".thu-cybercraze-agent"
 MAX_HISTORY = 24
-MAX_TOOL_ROUNDS = 12
 MAX_TOOL_OUTPUT_CHARS = 12000
 RESPONSE_INDENT = 2
 PANEL_INDENT = 3
@@ -59,6 +61,35 @@ SUCCESS = "green"
 
 console = Console(soft_wrap=True)
 prompt_session: PromptSession[str] | None = None
+
+
+def _slash_commands() -> list[str]:
+    return [
+        "/help",
+        "/sessions",
+        "/load",
+        "/new",
+        "/delete",
+        "/model",
+        "/key",
+        "/pwd",
+        "/alwaysRun",
+        "/exit",
+    ]
+
+
+def _slash_command_completer() -> ConditionalCompleter:
+    @Condition
+    def _starts_with_slash() -> bool:
+        app = prompt_session.app if prompt_session is not None else None
+        if app is None:
+            return False
+        return app.current_buffer.document.text.lstrip().startswith("/")
+
+    return ConditionalCompleter(
+        WordCompleter(_slash_commands(), ignore_case=True, match_middle=True, sentence=True),
+        _starts_with_slash,
+    )
 
 
 def _prompt(prompt: str, *, password: bool = False) -> str:
@@ -122,6 +153,10 @@ def _global_history_path() -> Path:
     return _global_config_dir() / HISTORY_FILE
 
 
+def _global_sessions_dir() -> Path:
+    return _global_config_dir() / "sessions"
+
+
 def _parse_env_file(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not env_path.exists():
@@ -166,6 +201,59 @@ def _save_base_url_to_env(base_url: str) -> None:
     values["THU_LAB_PROXY_BASE_URL"] = base_url
     lines = [f"{key}='{value}'" for key, value in values.items()]
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _slugify_session_name(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-._")
+    return slug or f"session-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+
+def _default_session_name() -> str:
+    return f"session-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+
+def _session_path(name: str) -> Path:
+    return _global_sessions_dir() / f"{_slugify_session_name(name)}.json"
+
+
+def _save_session(name: str, *, model: str, cwd: str, messages: list[dict[str, str]]) -> Path:
+    sessions_dir = _global_sessions_dir()
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_path = _session_path(name)
+    payload = {
+        "name": _slugify_session_name(name),
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "model": model,
+        "cwd": cwd,
+        "messages": messages,
+    }
+    session_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return session_path
+
+
+def _load_session(name: str) -> dict[str, Any]:
+    session_path = _session_path(name)
+    if not session_path.exists():
+        raise FileNotFoundError(f"session not found: {session_path.name}")
+    payload = json.loads(session_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("session file is invalid")
+    return payload
+
+
+def _list_sessions() -> list[str]:
+    sessions_dir = _global_sessions_dir()
+    if not sessions_dir.exists():
+        return []
+    return sorted(path.stem for path in sessions_dir.glob("*.json"))
+
+
+def _delete_session(name: str) -> bool:
+    session_path = _session_path(name)
+    if not session_path.exists():
+        return False
+    session_path.unlink()
+    return True
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -703,6 +791,10 @@ def _print_help() -> None:
                         [
                             "## Commands",
                             "- `/help` show this help",
+                            "- `/sessions` list saved sessions",
+                            "- `/load <name>` load a saved session",
+                            "- `/new [name]` start a new session",
+                            "- `/delete <name>` delete a saved session",
                             "- `/model` reselect the model for this session",
                             "- `/key` replace the API key for this session",
                             "- `/pwd` show current working directory",
@@ -749,7 +841,7 @@ def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
         Text(f"model  {model}", style=MUTED),
         Text(f"cwd    {cwd}", style=MUTED),
         Text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
-        Text("commands  /help  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
+        Text("commands  /help  /sessions  /load  /new  /delete  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
     )
     console.print()
     console.print(Padding(Panel(header, border_style=ACCENT, padding=(0, 2), title=" session "), (0, 0, 1, RESPONSE_INDENT)))
@@ -808,7 +900,11 @@ def main() -> int:
     file_env = _load_env_file(cwd)
     history_path = _global_history_path()
     history_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_session = PromptSession(history=FileHistory(str(history_path)))
+    prompt_session = PromptSession(
+        history=FileHistory(str(history_path)),
+        completer=_slash_command_completer(),
+        complete_while_typing=True,
+    )
     default_model = (
         os.environ.get("THU_AGENT_MODEL")
         or os.environ.get("THU_LAB_PROXY_MODEL")
@@ -832,7 +928,9 @@ def main() -> int:
     _save_base_url_to_env(base_url)
     always_run = False
 
+    session_name = _default_session_name()
     messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+    _save_session(session_name, model=model, cwd=cwd, messages=messages)
     _print_banner(model, cwd, runtime)
 
     while True:
@@ -849,9 +947,62 @@ def main() -> int:
         if user_input == "/help":
             _print_help()
             continue
+        if user_input == "/sessions":
+            sessions = _list_sessions()
+            if not sessions:
+                _render_info("no saved sessions")
+            else:
+                _render_markdown("\n".join(f"- `{name}`" for name in sessions))
+            continue
+        if user_input.startswith("/load"):
+            _, _, raw_name = user_input.partition(" ")
+            session_query = raw_name.strip() or _prompt("Session name: ").strip()
+            if not session_query:
+                _render_info("session name is required")
+                continue
+            try:
+                payload = _load_session(session_query)
+            except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+                _render_error_snippet("session load error", str(exc))
+                continue
+            loaded_messages = payload.get("messages")
+            loaded_model = str(payload.get("model", model)).strip() or model
+            if not isinstance(loaded_messages, list) or not loaded_messages:
+                _render_error_snippet("session load error", "session has no valid messages")
+                continue
+            session_name = str(payload.get("name", _slugify_session_name(session_query))).strip() or _slugify_session_name(session_query)
+            model = loaded_model if loaded_model in SUPPORTED_MODELS else model
+            messages = loaded_messages
+            _render_info(f"loaded session {session_name}")
+            continue
+        if user_input.startswith("/new"):
+            _, _, raw_name = user_input.partition(" ")
+            session_name = _slugify_session_name(raw_name) if raw_name.strip() else _default_session_name()
+            messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"started new session {session_name}")
+            continue
+        if user_input.startswith("/delete"):
+            _, _, raw_name = user_input.partition(" ")
+            session_query = raw_name.strip() or _prompt("Session name: ").strip()
+            if not session_query:
+                _render_info("session name is required")
+                continue
+            deleted = _delete_session(session_query)
+            if deleted:
+                _render_info(f"deleted session {_slugify_session_name(session_query)}")
+                if _slugify_session_name(session_query) == session_name:
+                    session_name = _default_session_name()
+                    messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    _render_info(f"started new session {session_name}")
+            else:
+                _render_info(f"session not found: {_slugify_session_name(session_query)}")
+            continue
         if user_input == "/model":
             model = _prompt_model(model)
             messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
             _render_info(f"model switched to {model}")
             continue
         if user_input == "/key":
@@ -876,9 +1027,10 @@ def main() -> int:
 
         messages.append({"role": "user", "content": user_input})
         messages = _trim_history(messages)
+        _save_session(session_name, model=model, cwd=cwd, messages=messages)
 
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
+            while True:
                 _render_step("Thinking")
                 try:
                     with console.status("[dim]thinking…[/dim]", spinner="dots"):
@@ -911,6 +1063,7 @@ def main() -> int:
 
                 assistant_text = response["text"].strip()
                 messages.append({"role": "assistant", "content": assistant_text})
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
                 action = _extract_json_object(assistant_text)
                 reasoning_text = _extract_reasoning_for_display(response, assistant_text, action)
                 _render_reasoning(reasoning_text)
@@ -918,6 +1071,7 @@ def main() -> int:
                 if not action:
                     messages.append({"role": "user", "content": _repair_instruction(assistant_text)})
                     messages = _trim_history(messages)
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
                     continue
 
                 action_type = action.get("type")
@@ -979,6 +1133,7 @@ def main() -> int:
                         tool_result = "\n\n".join(rendered_chunks)
                     messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                     messages = _trim_history(messages)
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
                     continue
 
                 if action_type != "run":
@@ -1015,12 +1170,7 @@ def main() -> int:
 
                 messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                 messages = _trim_history(messages)
-            else:
-                _render_step("Stopped")
-                _render_info(
-                    f"stopped after {MAX_TOOL_ROUNDS} tool rounds. "
-                    "ask the agent to be more direct, or continue with a narrower follow-up."
-                )
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
         except Exception as exc:
             _render_step("Runtime Error")
             _render_error_snippet("runtime error", str(exc))
