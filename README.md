@@ -92,6 +92,12 @@ or run the repo-local command directly from a shell alias.
 
 The agent uses the THU lab proxy.
 
+Create an API key first at:
+
+```text
+https://lab.cs.tsinghua.edu.cn/ai-platform/c/new
+```
+
 Base URL:
 
 ```text
