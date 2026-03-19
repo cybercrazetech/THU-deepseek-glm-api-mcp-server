@@ -1,4 +1,4 @@
-# THU CyberCraze Agent
+# NO RATE LIMIT FOR THU STUDENT!! THU Agent by CyberCraze
 
 Interactive terminal coding agent powered by the THU lab proxy OpenAI-compatible API.
 
