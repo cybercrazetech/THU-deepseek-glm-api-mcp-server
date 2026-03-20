@@ -9,7 +9,10 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,9 @@ from rich.text import Text
 
 DEFAULT_BASE_URL = "https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1"
 DEFAULT_MODEL = "deepseek-v3.2"
+APP_VERSION = "0.5.0"
+GITHUB_REPO_URL = "https://github.com/cybercrazetech/THU-deepseek-glm-api-mcp-server.git"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/cybercrazetech/THU-deepseek-glm-api-mcp-server/main/VERSION"
 SUPPORTED_MODELS = [
     "qwen3-max-thinking",
     "qwen3-max",
@@ -63,6 +69,7 @@ SUCCESS = "green"
 console = Console(soft_wrap=True)
 prompt_session: PromptSession[str] | None = None
 rendered_char_count = 0
+startup_update_notice: str | None = None
 
 
 def _slash_commands() -> list[str]:
@@ -73,6 +80,7 @@ def _slash_commands() -> list[str]:
         "/fork",
         "/new",
         "/delete",
+        "/update",
         "/model",
         "/key",
         "/pwd",
@@ -303,6 +311,135 @@ def _delete_session(name: str) -> bool:
         return False
     session_path.unlink()
     return True
+
+
+def _version_key(version: str) -> tuple[Any, ...]:
+    parts = re.findall(r"\d+|[A-Za-z]+", version)
+    key: list[Any] = []
+    for part in parts:
+        key.append(int(part) if part.isdigit() else part.lower())
+    return tuple(key)
+
+
+def _fetch_latest_version() -> str | None:
+    try:
+        with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+            response = client.get(GITHUB_VERSION_URL)
+            response.raise_for_status()
+    except Exception:
+        return None
+    remote_version = response.text.strip()
+    return remote_version or None
+
+
+def _check_for_update_notice() -> str | None:
+    latest_version = _fetch_latest_version()
+    if not latest_version:
+        return None
+    if _version_key(latest_version) <= _version_key(APP_VERSION):
+        return None
+    return f"update available: {APP_VERSION} -> {latest_version}. run /update"
+
+
+def _safe_completed_output(completed: subprocess.CompletedProcess[str]) -> str:
+    output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    return output[:2000] if len(output) > 2000 else output
+
+
+def _run_update_command(command: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def _linux_update_target() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path("/usr/local/bin/thu-agent")
+
+
+def _stage_windows_replacement(source_exe: Path, target_exe: Path, temp_root: Path) -> None:
+    script_path = temp_root / "apply-update.ps1"
+    source_text = str(source_exe).replace("'", "''")
+    target_text = str(target_exe).replace("'", "''")
+    temp_text = str(temp_root).replace("'", "''")
+    script_path.write_text(
+        "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                f"$PidToWait = {os.getpid()}",
+                f"$SourceExe = '{source_text}'",
+                f"$TargetExe = '{target_text}'",
+                f"$TempRoot = '{temp_text}'",
+                "while (Get-Process -Id $PidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 }",
+                "Copy-Item -Force $SourceExe $TargetExe",
+                "Remove-Item -Recurse -Force $TempRoot",
+            ]
+        ) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.Popen(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+
+
+def _perform_update(runtime: dict[str, str]) -> tuple[bool, str, bool]:
+    temp_root = Path(tempfile.mkdtemp(prefix="thu-agent-update-"))
+    keep_temp_root = False
+    try:
+        clone_result = _run_update_command(["git", "clone", "--depth", "1", GITHUB_REPO_URL, str(temp_root)])
+        if clone_result.returncode != 0:
+            return False, f"git clone failed:\n{_safe_completed_output(clone_result)}", False
+
+        if runtime["system"] == "Windows":
+            build_result = _run_update_command(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "build_agent_windows.ps1"],
+                cwd=str(temp_root),
+            )
+            if build_result.returncode != 0:
+                return False, f"windows build failed:\n{_safe_completed_output(build_result)}", False
+            source_exe = temp_root / "dist" / "thu-agent.exe"
+            target_exe = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else (Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "thu-agent.exe")
+            keep_temp_root = True
+            _stage_windows_replacement(source_exe, target_exe, temp_root)
+            return True, f"update staged for {target_exe}. the agent will exit so Windows can replace the executable.", True
+
+        build_env = os.environ.copy()
+        build_env.setdefault("XDG_CACHE_HOME", str(temp_root / ".cache"))
+        build_result = _run_update_command(["bash", "build_agent.sh"], cwd=str(temp_root), env=build_env)
+        if build_result.returncode != 0:
+            return False, f"linux build failed:\n{_safe_completed_output(build_result)}", False
+        source_bin = temp_root / "dist" / "thu-agent"
+        target_bin = _linux_update_target()
+        install_result = _run_update_command(["install", "-m", "755", str(source_bin), str(target_bin)])
+        if install_result.returncode != 0:
+            return False, f"install failed for {target_bin}:\n{_safe_completed_output(install_result)}", False
+        return True, f"updated executable at {target_bin}", False
+    finally:
+        if temp_root.exists() and not keep_temp_root:
+            try:
+                shutil.rmtree(temp_root)
+            except Exception:
+                pass
 
 
 def _normalize_base_url(base_url: str) -> str:
@@ -877,6 +1014,7 @@ def _print_help() -> None:
                             "- `/fork <id|name> [new-name]` copy a saved session into a new current session",
                             "- `/new [name]` start a new session",
                             "- `/delete <id|name>` delete a saved session",
+                            "- `/update` check GitHub and self-update the installed agent",
                             "- `/model` reselect the model for this session",
                             "- `/key` replace the API key for this session",
                             "- `/pwd` show current working directory",
@@ -921,10 +1059,11 @@ def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
     header = Group(
         Text("THU CyberCraze Agent", style=f"bold {ACCENT}"),
         Text("interactive coding session", style=f"italic {DIM}"),
+        Text(f"version {APP_VERSION}", style=MUTED),
         Text(f"model  {model}", style=MUTED),
         Text(f"cwd    {cwd}", style=MUTED),
         Text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
-        Text("commands  /help  /sessions  /load  /fork  /new  /delete  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
+        Text("commands  /help  /sessions  /load  /fork  /new  /delete  /update  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
     )
     console.print()
     console.print(Padding(Panel(header, border_style=ACCENT, padding=(0, 2), title=" session "), (0, 0, 1, RESPONSE_INDENT)))
@@ -978,7 +1117,7 @@ def _runtime_error_message(error_text: str) -> str:
 
 
 def main() -> int:
-    global prompt_session
+    global prompt_session, startup_update_notice
     parser = argparse.ArgumentParser(description="Interactive THU lab proxy terminal agent")
     parser.add_argument("--model", choices=SUPPORTED_MODELS, help="Model name")
     parser.add_argument("--api-key", help="API key for the current session")
@@ -1022,7 +1161,10 @@ def main() -> int:
     session_name = _default_session_name()
     messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
     _save_session(session_name, model=model, cwd=cwd, messages=messages)
+    startup_update_notice = _check_for_update_notice()
     _print_banner(model, cwd, runtime)
+    if startup_update_notice:
+        _render_info(startup_update_notice)
 
     while True:
         try:
@@ -1037,6 +1179,25 @@ def main() -> int:
             return 0
         if user_input == "/help":
             _print_help()
+            continue
+        if user_input == "/update":
+            latest_version = _fetch_latest_version()
+            if latest_version and _version_key(latest_version) <= _version_key(APP_VERSION):
+                _render_info(f"already up to date at {APP_VERSION}")
+                continue
+            confirm = _prompt("Update from GitHub now? [Y/n] ").strip().lower()
+            if confirm not in {"", "y", "yes"}:
+                _render_info("update cancelled")
+                continue
+            _render_step("Updating")
+            with console.status("[dim]updating from GitHub…[/dim]", spinner="dots"):
+                ok, message, should_exit = _perform_update(runtime)
+            if ok:
+                _render_info(message)
+                if should_exit:
+                    return 0
+            else:
+                _render_error_snippet("update error", message)
             continue
         if user_input == "/sessions":
             sessions = _list_sessions()

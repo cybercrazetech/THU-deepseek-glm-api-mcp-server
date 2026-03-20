@@ -177,11 +177,24 @@ Current supported models:
 Slash commands available in the session:
 
 - `/help`
+- `/sessions`
+- `/load <id|name>`
+- `/fork <id|name> [new-name]`
+- `/new [name]`
+- `/delete <id|name>`
+- `/update`
 - `/model`
 - `/key`
 - `/pwd`
 - `/alwaysRun`
 - `/exit`
+
+At startup, the agent compares its embedded version with the GitHub `VERSION` file. If a newer release exists, it shows a short reminder to run `/update`.
+
+`/update` behavior:
+
+- Linux: clones the GitHub repo to a temporary directory, rebuilds the binary, installs it to the current executable path or `/usr/local/bin/thu-agent`, and removes the temporary clone. If the install target needs elevated permissions, run the agent with appropriate privileges or update manually.
+- Windows: stages a post-exit replacement of the running `.exe` after rebuilding from a temporary clone, then exits so the replacement can complete.
 
 While the agent is thinking or running a command, press `Ctrl+C` to cancel the current operation and return to the prompt without exiting the whole session.
 
