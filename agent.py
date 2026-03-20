@@ -50,6 +50,7 @@ HISTORY_FILE = ".thu-agent-history"
 CONFIG_DIR_NAME = ".thu-cybercraze-agent"
 MAX_HISTORY = 24
 MAX_TOOL_OUTPUT_CHARS = 12000
+MAX_RENDERED_CHARS = 50000
 RESPONSE_INDENT = 2
 PANEL_INDENT = 3
 
@@ -61,6 +62,7 @@ SUCCESS = "green"
 
 console = Console(soft_wrap=True)
 prompt_session: PromptSession[str] | None = None
+rendered_char_count = 0
 
 
 def _slash_commands() -> list[str]:
@@ -68,6 +70,7 @@ def _slash_commands() -> list[str]:
         "/help",
         "/sessions",
         "/load",
+        "/fork",
         "/new",
         "/delete",
         "/model",
@@ -157,6 +160,15 @@ def _global_sessions_dir() -> Path:
     return _global_config_dir() / "sessions"
 
 
+def _touch_render_budget(estimated_chars: int) -> None:
+    global rendered_char_count
+    if rendered_char_count + estimated_chars > MAX_RENDERED_CHARS:
+        console.clear()
+        console.print(Padding(Text("terminal output cleared to keep the session readable", style=f"dim {DIM}"), (0, 0, 0, RESPONSE_INDENT)))
+        rendered_char_count = 0
+    rendered_char_count += estimated_chars
+
+
 def _parse_env_file(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not env_path.exists():
@@ -216,6 +228,15 @@ def _session_path(name: str) -> Path:
     return _global_sessions_dir() / f"{_slugify_session_name(name)}.json"
 
 
+def _session_summary(messages: list[dict[str, str]], name: str) -> str:
+    for message in messages:
+        if message.get("role") == "user":
+            text = str(message.get("content", "")).strip().replace("\n", " ")
+            if text:
+                return text[:80]
+    return _slugify_session_name(name)
+
+
 def _save_session(name: str, *, model: str, cwd: str, messages: list[dict[str, str]]) -> Path:
     sessions_dir = _global_sessions_dir()
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -223,8 +244,10 @@ def _save_session(name: str, *, model: str, cwd: str, messages: list[dict[str, s
     payload = {
         "name": _slugify_session_name(name),
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "last_used_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "model": model,
         "cwd": cwd,
+        "summary": _session_summary(messages, name),
         "messages": messages,
     }
     session_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
@@ -241,11 +264,37 @@ def _load_session(name: str) -> dict[str, Any]:
     return payload
 
 
-def _list_sessions() -> list[str]:
+def _list_sessions() -> list[dict[str, Any]]:
     sessions_dir = _global_sessions_dir()
     if not sessions_dir.exists():
         return []
-    return sorted(path.stem for path in sessions_dir.glob("*.json"))
+    entries: list[dict[str, Any]] = []
+    for path in sessions_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        entries.append(
+            {
+                "name": path.stem,
+                "summary": str(payload.get("summary", path.stem)).strip() or path.stem,
+                "last_used_at": str(payload.get("last_used_at", payload.get("saved_at", ""))).strip(),
+                "model": str(payload.get("model", "")).strip(),
+            }
+        )
+    entries.sort(key=lambda item: item["last_used_at"], reverse=True)
+    return entries
+
+
+def _resolve_session_reference(reference: str) -> str:
+    reference = reference.strip()
+    sessions = _list_sessions()
+    if reference.isdigit():
+        index = int(reference)
+        if 1 <= index <= len(sessions):
+            return str(sessions[index - 1]["name"])
+        raise FileNotFoundError(f"session id not found: {reference}")
+    return _slugify_session_name(reference)
 
 
 def _delete_session(name: str) -> bool:
@@ -330,7 +379,7 @@ def _extract_api_error(payload: dict[str, Any]) -> tuple[int | None, str | None]
 
 
 def _should_retry(status_code: int | None, message: str | None) -> bool:
-    if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+    if status_code in {400, 408, 409, 425, 429, 500, 502, 503, 504}:
         return True
     if not message:
         return False
@@ -386,7 +435,7 @@ def _chat_completion(
                         error_message = f"HTTP {status_code} redirect from upstream"
                 if status_code == 404:
                     error_message = f"HTTP 404 from upstream at {url}"
-                if attempt < max_retries and status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                if attempt < max_retries and status_code in {400, 408, 409, 425, 429, 500, 502, 503, 504}:
                     time.sleep(attempt + 1)
                     continue
                 return {
@@ -619,6 +668,7 @@ def _render_reasoning(reasoning_text: str) -> None:
     normalized = _normalize_reasoning_text(reasoning_text)
     if not normalized:
         return
+    _touch_render_budget(len(normalized) + 200)
     text = Text(normalized, style=f"italic dim {MUTED}")
     console.print(
         Padding(
@@ -635,6 +685,7 @@ def _render_reasoning(reasoning_text: str) -> None:
 
 
 def _render_step(title: str, subtitle: str = "") -> None:
+    _touch_render_budget(len(title) + len(subtitle) + 40)
     text = Text(title, style=f"bold {ACCENT}")
     if subtitle:
         text.append("  ", style=DIM)
@@ -644,10 +695,12 @@ def _render_step(title: str, subtitle: str = "") -> None:
 
 def _render_markdown(markdown_text: str) -> None:
     content = markdown_text.strip() or "_No response._"
+    _touch_render_budget(len(content) + 200)
     console.print(Padding(Markdown(content), (0, 1, 0, RESPONSE_INDENT)))
 
 
 def _render_snippet(title: str, code: str, language: str = "text") -> None:
+    _touch_render_budget(len(title) + len(code) + 200)
     syntax = Syntax(code.rstrip() or " ", language or "text", theme="monokai", line_numbers=False, word_wrap=True)
     console.print(
         Padding(
@@ -658,6 +711,7 @@ def _render_snippet(title: str, code: str, language: str = "text") -> None:
 
 
 def _render_command_request(command: str, reason: str) -> None:
+    _touch_render_budget(len(command) + len(reason) + 200)
     group_items: list[Any] = [Syntax(command, "bash", theme="monokai", word_wrap=True)]
     if reason:
         group_items.append(Text(reason, style=f"italic dim {MUTED}"))
@@ -670,6 +724,7 @@ def _render_command_request(command: str, reason: str) -> None:
 
 
 def _render_command_batch(command_items: list[dict[str, str]], reason: str) -> None:
+    _touch_render_budget(sum(len(item["command"]) + len(item["reason"]) for item in command_items) + len(reason) + 300)
     blocks: list[Any] = []
     if reason:
         blocks.append(Text(reason, style=f"italic dim {MUTED}"))
@@ -686,6 +741,7 @@ def _render_command_batch(command_items: list[dict[str, str]], reason: str) -> N
 
 
 def _render_command_result(command: str, exit_code: int, output: str) -> None:
+    _touch_render_budget(len(command) + len(output) + 250)
     header = Text()
     header.append("exit ", style=f"dim {MUTED}")
     header.append(str(exit_code), style=SUCCESS if exit_code == 0 else ERROR)
@@ -727,11 +783,13 @@ def _run_commands_sequential(command_items: list[dict[str, str]], cwd: str) -> l
 
 
 def _render_info(text: str) -> None:
+    _touch_render_budget(len(text) + 40)
     console.print(Padding(Text(text, style=f"dim {MUTED}"), (0, 0, 0, RESPONSE_INDENT)))
 
 
 def _render_error_snippet(title: str, error_text: str) -> None:
     preview = error_text.strip()[:800] or "Unknown error"
+    _touch_render_budget(len(title) + len(preview) + 100)
     console.print(
         Padding(
             Panel(
@@ -792,9 +850,10 @@ def _print_help() -> None:
                             "## Commands",
                             "- `/help` show this help",
                             "- `/sessions` list saved sessions",
-                            "- `/load <name>` load a saved session",
+                            "- `/load <id|name>` load a saved session",
+                            "- `/fork <id|name> [new-name]` copy a saved session into a new current session",
                             "- `/new [name]` start a new session",
-                            "- `/delete <name>` delete a saved session",
+                            "- `/delete <id|name>` delete a saved session",
                             "- `/model` reselect the model for this session",
                             "- `/key` replace the API key for this session",
                             "- `/pwd` show current working directory",
@@ -841,7 +900,7 @@ def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
         Text(f"model  {model}", style=MUTED),
         Text(f"cwd    {cwd}", style=MUTED),
         Text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
-        Text("commands  /help  /sessions  /load  /new  /delete  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
+        Text("commands  /help  /sessions  /load  /fork  /new  /delete  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
     )
     console.print()
     console.print(Padding(Panel(header, border_style=ACCENT, padding=(0, 2), title=" session "), (0, 0, 1, RESPONSE_INDENT)))
@@ -884,6 +943,14 @@ def _command_batch_parallel(action: dict[str, Any]) -> bool:
     if isinstance(raw, bool):
         return raw
     return False
+
+
+def _runtime_error_message(error_text: str) -> str:
+    return (
+        "The last tool or runtime step failed inside the agent.\n"
+        "Treat this like a normal tool result, explain the problem briefly, and continue the task.\n"
+        f"Runtime error:\n{error_text}"
+    )
 
 
 def main() -> int:
@@ -952,7 +1019,13 @@ def main() -> int:
             if not sessions:
                 _render_info("no saved sessions")
             else:
-                _render_markdown("\n".join(f"- `{name}`" for name in sessions))
+                lines = ["| ID | Session | Last Used | Model | Summary |", "| --- | --- | --- | --- | --- |"]
+                for idx, session in enumerate(sessions, start=1):
+                    lines.append(
+                        f"| {idx} | `{session['name']}` | {session['last_used_at'] or '-'} | "
+                        f"{session['model'] or '-'} | {session['summary']} |"
+                    )
+                _render_markdown("\n".join(lines))
             continue
         if user_input.startswith("/load"):
             _, _, raw_name = user_input.partition(" ")
@@ -961,7 +1034,7 @@ def main() -> int:
                 _render_info("session name is required")
                 continue
             try:
-                payload = _load_session(session_query)
+                payload = _load_session(_resolve_session_reference(session_query))
             except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
                 _render_error_snippet("session load error", str(exc))
                 continue
@@ -973,7 +1046,34 @@ def main() -> int:
             session_name = str(payload.get("name", _slugify_session_name(session_query))).strip() or _slugify_session_name(session_query)
             model = loaded_model if loaded_model in SUPPORTED_MODELS else model
             messages = loaded_messages
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
             _render_info(f"loaded session {session_name}")
+            continue
+        if user_input.startswith("/fork"):
+            _, _, raw_args = user_input.partition(" ")
+            parts = raw_args.strip().split(maxsplit=1) if raw_args.strip() else []
+            source_ref = parts[0] if parts else _prompt("Session id or name: ").strip()
+            if not source_ref:
+                _render_info("session id or name is required")
+                continue
+            fork_name = parts[1].strip() if len(parts) > 1 else ""
+            if not fork_name:
+                fork_name = _prompt("New session name (optional): ").strip()
+            try:
+                payload = _load_session(_resolve_session_reference(source_ref))
+            except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+                _render_error_snippet("session fork error", str(exc))
+                continue
+            loaded_messages = payload.get("messages")
+            loaded_model = str(payload.get("model", model)).strip() or model
+            if not isinstance(loaded_messages, list) or not loaded_messages:
+                _render_error_snippet("session fork error", "session has no valid messages")
+                continue
+            session_name = _slugify_session_name(fork_name) if fork_name else _default_session_name()
+            model = loaded_model if loaded_model in SUPPORTED_MODELS else model
+            messages = loaded_messages
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"forked session into {session_name}")
             continue
         if user_input.startswith("/new"):
             _, _, raw_name = user_input.partition(" ")
@@ -988,16 +1088,17 @@ def main() -> int:
             if not session_query:
                 _render_info("session name is required")
                 continue
-            deleted = _delete_session(session_query)
+            resolved_name = _resolve_session_reference(session_query)
+            deleted = _delete_session(resolved_name)
             if deleted:
-                _render_info(f"deleted session {_slugify_session_name(session_query)}")
-                if _slugify_session_name(session_query) == session_name:
+                _render_info(f"deleted session {resolved_name}")
+                if resolved_name == session_name:
                     session_name = _default_session_name()
                     messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
                     _save_session(session_name, model=model, cwd=cwd, messages=messages)
                     _render_info(f"started new session {session_name}")
             else:
-                _render_info(f"session not found: {_slugify_session_name(session_query)}")
+                _render_info(f"session not found: {resolved_name}")
             continue
         if user_input == "/model":
             model = _prompt_model(model)
@@ -1058,6 +1159,12 @@ def main() -> int:
                         api_key = _prompt_api_key(None)
                         _save_api_key_to_env(api_key)
                         _render_info(f"saved updated API key to {_global_env_path()}")
+                        continue
+                    if response.get("status") in {None, 400, 408, 409, 425, 429, 500, 502, 503, 504}:
+                        _render_info("attempting to continue after upstream error")
+                        messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
+                        messages = _trim_history(messages)
+                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
                         continue
                     break
 
@@ -1174,6 +1281,10 @@ def main() -> int:
         except Exception as exc:
             _render_step("Runtime Error")
             _render_error_snippet("runtime error", str(exc))
+            messages.append({"role": "user", "content": _runtime_error_message(str(exc))})
+            messages = _trim_history(messages)
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            continue
 
         console.print(Rule(style=DIM))
 
