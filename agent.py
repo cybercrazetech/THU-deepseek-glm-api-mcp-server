@@ -32,7 +32,7 @@ from rich.text import Text
 
 DEFAULT_BASE_URL = "https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1"
 DEFAULT_MODEL = "deepseek-v3.2"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 GITHUB_REPO_URL = "https://github.com/cybercrazetech/THU-deepseek-glm-api-mcp-server.git"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/cybercrazetech/THU-deepseek-glm-api-mcp-server/main/VERSION"
 SUPPORTED_MODELS = [
@@ -168,10 +168,23 @@ def _global_sessions_dir() -> Path:
     return _global_config_dir() / "sessions"
 
 
+def _clear_terminal_screen() -> None:
+    runtime = _detect_runtime()
+    try:
+        if runtime["system"] == "Windows":
+            os.system("cls")
+        else:
+            # Clear screen and scrollback like a normal terminal clear.
+            sys.stdout.write("\033[3J\033[2J\033[H")
+            sys.stdout.flush()
+    except Exception:
+        console.clear()
+
+
 def _touch_render_budget(estimated_chars: int) -> None:
     global rendered_char_count
     if rendered_char_count + estimated_chars > MAX_RENDERED_CHARS:
-        console.clear()
+        _clear_terminal_screen()
         console.print(Padding(Text("terminal output cleared to keep the session readable", style=f"dim {DIM}"), (0, 0, 0, RESPONSE_INDENT)))
         rendered_char_count = 0
     rendered_char_count += estimated_chars
