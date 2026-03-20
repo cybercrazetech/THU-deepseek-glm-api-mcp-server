@@ -600,10 +600,13 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             cmd = ["powershell", "-NoProfile", "-Command", command]
         else:
             cmd = ["/bin/bash", "-lc", command]
+        def _decode_output(data: bytes | None) -> str:
+            if not data:
+                return ""
+            return data.decode("utf-8", errors="replace")
         process = subprocess.Popen(
             cmd,
             cwd=cwd,
-            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -616,11 +619,11 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             except subprocess.TimeoutExpired:
                 process.kill()
                 stdout, stderr = process.communicate()
-            output = ((stdout or "") + (stderr or "")).strip()
+            output = (_decode_output(stdout) + _decode_output(stderr)).strip()
             if len(output) > MAX_TOOL_OUTPUT_CHARS:
                 output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
             return {"exit_code": 130, "output": (output + "\nInterrupted by user.").strip(), "interrupted": True}
-        output = (stdout or "") + (stderr or "")
+        output = _decode_output(stdout) + _decode_output(stderr)
         if len(output) > MAX_TOOL_OUTPUT_CHARS:
             output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
         exit_code = process.returncode
@@ -1151,179 +1154,182 @@ def main() -> int:
         messages = _trim_history(messages)
         _save_session(session_name, model=model, cwd=cwd, messages=messages)
 
-        try:
-            while True:
-                _render_step("Thinking")
-                try:
-                    with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                        response = _chat_completion(
-                            api_key=api_key,
-                            model=model,
-                            messages=messages,
-                            base_url=base_url,
-                        )
-                except KeyboardInterrupt:
-                    _render_step("Cancelled")
-                    _render_info("interrupted current model request")
-                    if messages and messages[-1].get("role") == "user":
-                        messages.pop()
-                    break
-                if not response["ok"]:
-                    _render_step("Upstream Error")
-                    console.print(Padding(f"upstream error: {response['error']}", (0, 0, 0, RESPONSE_INDENT)), style=ERROR)
-                    if response.get("status") == 404:
-                        _render_info(f"active base URL: {base_url}")
-                        _render_info("this 404 is coming from the upstream proxy, not from local command execution.")
-                        _render_info("check the selected model, retry later, or rotate the proxy key if access changed.")
-                    if _is_invalid_api_key(str(response["error"]), response.get("status")):
-                        _render_info("stored API key appears invalid or expired. enter a new key.")
-                        api_key = _prompt_api_key(None)
-                        _save_api_key_to_env(api_key)
-                        _render_info(f"saved updated API key to {_global_env_path()}")
-                        continue
-                    if response.get("status") in {None, 400, 408, 409, 425, 429, 500, 502, 503, 504}:
-                        _render_info("attempting to continue after upstream error")
-                        messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
+        while True:
+            try:
+                while True:
+                    _render_step("Thinking")
+                    try:
+                        with console.status("[dim]thinking…[/dim]", spinner="dots"):
+                            response = _chat_completion(
+                                api_key=api_key,
+                                model=model,
+                                messages=messages,
+                                base_url=base_url,
+                            )
+                    except KeyboardInterrupt:
+                        _render_step("Cancelled")
+                        _render_info("interrupted current model request")
+                        if messages and messages[-1].get("role") == "user":
+                            messages.pop()
+                        break
+                    if not response["ok"]:
+                        _render_step("Upstream Error")
+                        console.print(Padding(f"upstream error: {response['error']}", (0, 0, 0, RESPONSE_INDENT)), style=ERROR)
+                        if response.get("status") == 404:
+                            _render_info(f"active base URL: {base_url}")
+                            _render_info("this 404 is coming from the upstream proxy, not from local command execution.")
+                            _render_info("check the selected model, retry later, or rotate the proxy key if access changed.")
+                        if _is_invalid_api_key(str(response["error"]), response.get("status")):
+                            _render_info("stored API key appears invalid or expired. enter a new key.")
+                            api_key = _prompt_api_key(None)
+                            _save_api_key_to_env(api_key)
+                            _render_info(f"saved updated API key to {_global_env_path()}")
+                            continue
+                        if response.get("status") in {None, 400, 408, 409, 425, 429, 500, 502, 503, 504}:
+                            _render_info("attempting to continue after upstream error")
+                            messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
+                            messages = _trim_history(messages)
+                            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                            continue
+                        break
+
+                    assistant_text = response["text"].strip()
+                    messages.append({"role": "assistant", "content": assistant_text})
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    action = _extract_json_object(assistant_text)
+                    reasoning_text = _extract_reasoning_for_display(response, assistant_text, action)
+                    _render_reasoning(reasoning_text)
+
+                    if not action:
+                        messages.append({"role": "user", "content": _repair_instruction(assistant_text)})
                         messages = _trim_history(messages)
                         _save_session(session_name, model=model, cwd=cwd, messages=messages)
                         continue
-                    break
 
-                assistant_text = response["text"].strip()
-                messages.append({"role": "assistant", "content": assistant_text})
-                _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                action = _extract_json_object(assistant_text)
-                reasoning_text = _extract_reasoning_for_display(response, assistant_text, action)
-                _render_reasoning(reasoning_text)
-
-                if not action:
-                    messages.append({"role": "user", "content": _repair_instruction(assistant_text)})
-                    messages = _trim_history(messages)
-                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                    continue
-
-                action_type = action.get("type")
-                if action_type == "reply":
-                    _render_step(_action_summary("reply", str(action.get("reason", "")).strip()))
-                    _render_markdown(str(action.get("message", "")).strip())
-                    snippet = action.get("snippet")
-                    if isinstance(snippet, dict):
-                        code = str(snippet.get("content", "")).strip()
-                        if code:
-                            _render_snippet(
-                                str(snippet.get("title", "snippet")).strip() or "snippet",
-                                code,
-                                str(snippet.get("language", "text")).strip() or "text",
-                            )
-                    break
-
-                if action_type == "run_many":
-                    command_items = _normalize_command_batch(action)
-                    run_parallel = _command_batch_parallel(action)
-                    if not command_items:
-                        console.print("empty command batch request", style=ERROR)
+                    action_type = action.get("type")
+                    if action_type == "reply":
+                        _render_step(_action_summary("reply", str(action.get("reason", "")).strip()))
+                        _render_markdown(str(action.get("message", "")).strip())
+                        snippet = action.get("snippet")
+                        if isinstance(snippet, dict):
+                            code = str(snippet.get("content", "")).strip()
+                            if code:
+                                _render_snippet(
+                                    str(snippet.get("title", "snippet")).strip() or "snippet",
+                                    code,
+                                    str(snippet.get("language", "text")).strip() or "text",
+                                )
                         break
-                    _render_step(_action_summary("run_many", str(action.get("reason", "")).strip(), len(command_items)))
-                    _render_command_batch(command_items, str(action.get("reason", "")).strip())
+
+                    if action_type == "run_many":
+                        command_items = _normalize_command_batch(action)
+                        run_parallel = _command_batch_parallel(action)
+                        if not command_items:
+                            console.print("empty command batch request", style=ERROR)
+                            break
+                        _render_step(_action_summary("run_many", str(action.get("reason", "")).strip(), len(command_items)))
+                        _render_command_batch(command_items, str(action.get("reason", "")).strip())
+                        if not _prompt_run_command(always_run):
+                            tool_result = "Command batch was not approved by the user."
+                            _render_info(tool_result)
+                        else:
+                            mode_label = "in parallel" if run_parallel else "sequentially"
+                            _render_step("Running Commands", f"{len(command_items)} {mode_label}")
+                            try:
+                                with console.status("[dim]running commands…[/dim]", spinner="dots"):
+                                    if run_parallel:
+                                        results = _run_commands_parallel(command_items, cwd)
+                                    else:
+                                        results = _run_commands_sequential(command_items, cwd)
+                            except KeyboardInterrupt:
+                                _render_step("Cancelled")
+                                _render_info("interrupted command batch")
+                                break
+                            _render_step("Command Results")
+                            rendered_chunks: list[str] = []
+                            for result in results:
+                                _render_command_result(result["command"], result["exit_code"], result["output"])
+                                status_line = ""
+                                if result.get("terminated"):
+                                    status_line = "Status: terminated unexpectedly"
+                                elif result.get("interrupted"):
+                                    status_line = "Status: interrupted by user"
+                                rendered_chunks.append(
+                                    "\n".join(
+                                        [line for line in [
+                                            f"Command: {result['command']}",
+                                            f"Reason: {result['reason']}",
+                                            f"Exit code: {result['exit_code']}",
+                                            status_line,
+                                            "Output:",
+                                            result["output"],
+                                        ] if line]
+                                    )
+                                )
+                                if result.get("terminated"):
+                                    _render_info("command batch stopped because a command terminated unexpectedly")
+                                    break
+                                if result.get("interrupted"):
+                                    break
+                            tool_result = "\n\n".join(rendered_chunks)
+                        messages.append({"role": "user", "content": _tool_result_message(tool_result)})
+                        messages = _trim_history(messages)
+                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                        continue
+
+                    if action_type != "run":
+                        console.print("invalid tool response from model", style=ERROR)
+                        _render_snippet("raw", assistant_text, "json")
+                        break
+
+                    command = str(action.get("command", "")).strip()
+                    reason = str(action.get("reason", "")).strip()
+                    if not command:
+                        console.print("empty command request", style=ERROR)
+                        break
+
+                    _render_step(_action_summary("run", reason))
+                    _render_command_request(command, reason)
                     if not _prompt_run_command(always_run):
-                        tool_result = "Command batch was not approved by the user."
+                        tool_result = "Command was not approved by the user."
                         _render_info(tool_result)
                     else:
-                        mode_label = "in parallel" if run_parallel else "sequentially"
-                        _render_step("Running Commands", f"{len(command_items)} {mode_label}")
-                        try:
-                            with console.status("[dim]running commands…[/dim]", spinner="dots"):
-                                if run_parallel:
-                                    results = _run_commands_parallel(command_items, cwd)
-                                else:
-                                    results = _run_commands_sequential(command_items, cwd)
-                        except KeyboardInterrupt:
-                            _render_step("Cancelled")
-                            _render_info("interrupted command batch")
-                            break
-                        _render_step("Command Results")
-                        rendered_chunks: list[str] = []
-                        for result in results:
-                            _render_command_result(result["command"], result["exit_code"], result["output"])
-                            status_line = ""
-                            if result.get("terminated"):
-                                status_line = "Status: terminated unexpectedly"
-                            elif result.get("interrupted"):
-                                status_line = "Status: interrupted by user"
-                            rendered_chunks.append(
-                                "\n".join(
-                                    [line for line in [
-                                        f"Command: {result['command']}",
-                                        f"Reason: {result['reason']}",
-                                        f"Exit code: {result['exit_code']}",
-                                        status_line,
-                                        "Output:",
-                                        result["output"],
-                                    ] if line]
-                                )
-                            )
-                            if result.get("terminated"):
-                                _render_info("command batch stopped because a command terminated unexpectedly")
-                                break
-                            if result.get("interrupted"):
-                                break
-                        tool_result = "\n\n".join(rendered_chunks)
-                    messages.append({"role": "user", "content": _tool_result_message(tool_result)})
-                    messages = _trim_history(messages)
-                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                    continue
-
-                if action_type != "run":
-                    console.print("invalid tool response from model", style=ERROR)
-                    _render_snippet("raw", assistant_text, "json")
-                    break
-
-                command = str(action.get("command", "")).strip()
-                reason = str(action.get("reason", "")).strip()
-                if not command:
-                    console.print("empty command request", style=ERROR)
-                    break
-
-                _render_step(_action_summary("run", reason))
-                _render_command_request(command, reason)
-                if not _prompt_run_command(always_run):
-                    tool_result = "Command was not approved by the user."
-                    _render_info(tool_result)
-                else:
-                    _render_step("Running Command")
-                    with console.status("[dim]running command…[/dim]", spinner="dots"):
-                        result = _run_command(command, cwd)
-                    _render_step("Command Result")
-                    tool_result = (
-                        f"Command: {command}\n"
-                        f"Exit code: {result['exit_code']}\n"
-                        f"Output:\n{result['output']}"
-                    )
-                    if result.get("terminated"):
+                        _render_step("Running Command")
+                        with console.status("[dim]running command…[/dim]", spinner="dots"):
+                            result = _run_command(command, cwd)
+                        _render_step("Command Result")
                         tool_result = (
                             f"Command: {command}\n"
                             f"Exit code: {result['exit_code']}\n"
-                            "Status: terminated unexpectedly\n"
                             f"Output:\n{result['output']}"
                         )
-                    _render_command_result(command, result["exit_code"], result["output"])
-                    if result.get("terminated"):
-                        _render_info("command terminated unexpectedly")
-                    if result.get("interrupted"):
-                        _render_step("Cancelled")
-                        _render_info("interrupted current command")
-                        break
+                        if result.get("terminated"):
+                            tool_result = (
+                                f"Command: {command}\n"
+                                f"Exit code: {result['exit_code']}\n"
+                                "Status: terminated unexpectedly\n"
+                                f"Output:\n{result['output']}"
+                            )
+                        _render_command_result(command, result["exit_code"], result["output"])
+                        if result.get("terminated"):
+                            _render_info("command terminated unexpectedly")
+                        if result.get("interrupted"):
+                            _render_step("Cancelled")
+                            _render_info("interrupted current command")
+                            break
 
-                messages.append({"role": "user", "content": _tool_result_message(tool_result)})
+                    messages.append({"role": "user", "content": _tool_result_message(tool_result)})
+                    messages = _trim_history(messages)
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                break
+            except Exception as exc:
+                _render_step("Runtime Error")
+                _render_error_snippet("runtime error", str(exc))
+                messages.append({"role": "user", "content": _runtime_error_message(str(exc))})
                 messages = _trim_history(messages)
                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
-        except Exception as exc:
-            _render_step("Runtime Error")
-            _render_error_snippet("runtime error", str(exc))
-            messages.append({"role": "user", "content": _runtime_error_message(str(exc))})
-            messages = _trim_history(messages)
-            _save_session(session_name, model=model, cwd=cwd, messages=messages)
-            continue
+                _render_info("attempting to continue after runtime error")
+                continue
 
         console.print(Rule(style=DIM))
 
