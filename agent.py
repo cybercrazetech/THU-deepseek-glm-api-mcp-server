@@ -623,20 +623,39 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
         output = (stdout or "") + (stderr or "")
         if len(output) > MAX_TOOL_OUTPUT_CHARS:
             output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
-        return {"exit_code": process.returncode, "output": output.strip(), "interrupted": False}
+        exit_code = process.returncode
+        terminated = exit_code < 0
+        normalized_output = output.strip()
+        if terminated:
+            signal_number = abs(exit_code)
+            suffix = f"Process terminated by signal {signal_number}."
+            normalized_output = f"{normalized_output}\n{suffix}".strip() if normalized_output else suffix
+        return {
+            "exit_code": exit_code,
+            "output": normalized_output,
+            "interrupted": False,
+            "terminated": terminated,
+        }
     except subprocess.TimeoutExpired:
-        return {"exit_code": 124, "output": "Command timed out after 120 seconds.", "interrupted": False}
+        return {
+            "exit_code": 124,
+            "output": "Command timed out after 120 seconds.",
+            "interrupted": False,
+            "terminated": False,
+        }
     except FileNotFoundError as exc:
         return {
             "exit_code": 127,
             "output": f"Shell launch failed: {exc}",
             "interrupted": False,
+            "terminated": False,
         }
     except OSError as exc:
         return {
             "exit_code": 127,
             "output": f"Command runner failed: {exc}",
             "interrupted": False,
+            "terminated": False,
         }
 
 
@@ -775,9 +794,10 @@ def _run_commands_sequential(command_items: list[dict[str, str]], cwd: str) -> l
                 "exit_code": result["exit_code"],
                 "output": result["output"],
                 "interrupted": result.get("interrupted", False),
+                "terminated": result.get("terminated", False),
             }
         )
-        if result.get("interrupted"):
+        if result.get("interrupted") or result.get("terminated"):
             break
     return results
 
@@ -888,6 +908,7 @@ def _run_commands_parallel(command_items: list[dict[str, str]], cwd: str) -> lis
                     "reason": item["reason"],
                     "exit_code": result["exit_code"],
                     "output": result["output"],
+                    "terminated": result.get("terminated", False),
                 }
             )
     return sorted(results, key=lambda item: item["index"])
@@ -1224,17 +1245,26 @@ def main() -> int:
                         rendered_chunks: list[str] = []
                         for result in results:
                             _render_command_result(result["command"], result["exit_code"], result["output"])
+                            status_line = ""
+                            if result.get("terminated"):
+                                status_line = "Status: terminated unexpectedly"
+                            elif result.get("interrupted"):
+                                status_line = "Status: interrupted by user"
                             rendered_chunks.append(
                                 "\n".join(
-                                    [
+                                    [line for line in [
                                         f"Command: {result['command']}",
                                         f"Reason: {result['reason']}",
                                         f"Exit code: {result['exit_code']}",
+                                        status_line,
                                         "Output:",
                                         result["output"],
-                                    ]
+                                    ] if line]
                                 )
                             )
+                            if result.get("terminated"):
+                                _render_info("command batch stopped because a command terminated unexpectedly")
+                                break
                             if result.get("interrupted"):
                                 break
                         tool_result = "\n\n".join(rendered_chunks)
@@ -1269,7 +1299,16 @@ def main() -> int:
                         f"Exit code: {result['exit_code']}\n"
                         f"Output:\n{result['output']}"
                     )
+                    if result.get("terminated"):
+                        tool_result = (
+                            f"Command: {command}\n"
+                            f"Exit code: {result['exit_code']}\n"
+                            "Status: terminated unexpectedly\n"
+                            f"Output:\n{result['output']}"
+                        )
                     _render_command_result(command, result["exit_code"], result["output"])
+                    if result.get("terminated"):
+                        _render_info("command terminated unexpectedly")
                     if result.get("interrupted"):
                         _render_step("Cancelled")
                         _render_info("interrupted current command")
