@@ -75,6 +75,8 @@ startup_update_notice: str | None = None
 def _slash_commands() -> list[str]:
     return [
         "/help",
+        "/save",
+        "/autosave",
         "/sessions",
         "/load",
         "/fork",
@@ -1022,6 +1024,8 @@ def _print_help() -> None:
                         [
                             "## Commands",
                             "- `/help` show this help",
+                            "- `/save [name]` save the current in-memory session",
+                            "- `/autosave` toggle automatic saving for the current session",
                             "- `/sessions` list saved sessions",
                             "- `/load <id|name>` load a saved session",
                             "- `/fork <id|name> [new-name]` copy a saved session into a new current session",
@@ -1076,7 +1080,7 @@ def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
         Text(f"model  {model}", style=MUTED),
         Text(f"cwd    {cwd}", style=MUTED),
         Text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
-        Text("commands  /help  /sessions  /load  /fork  /new  /delete  /update  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
+        Text("commands  /help  /save  /autosave  /sessions  /load  /fork  /new  /delete  /update  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
     )
     console.print()
     console.print(Padding(Panel(header, border_style=ACCENT, padding=(0, 2), title=" session "), (0, 0, 1, RESPONSE_INDENT)))
@@ -1170,10 +1174,10 @@ def main() -> int:
     _save_api_key_to_env(api_key)
     _save_base_url_to_env(base_url)
     always_run = False
+    autosave = False
 
     session_name = _default_session_name()
     messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
-    _save_session(session_name, model=model, cwd=cwd, messages=messages)
     startup_update_notice = _check_for_update_notice()
     _print_banner(model, cwd, runtime)
     if startup_update_notice:
@@ -1192,6 +1196,20 @@ def main() -> int:
             return 0
         if user_input == "/help":
             _print_help()
+            continue
+        if user_input.startswith("/save"):
+            _, _, raw_name = user_input.partition(" ")
+            if raw_name.strip():
+                session_name = _slugify_session_name(raw_name)
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"saved session {session_name}")
+            continue
+        if user_input == "/autosave":
+            autosave = not autosave
+            state = "enabled" if autosave else "disabled"
+            _render_info(f"autosave {state} for current session")
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
             continue
         if user_input == "/update":
             latest_version = _fetch_latest_version()
@@ -1244,7 +1262,8 @@ def main() -> int:
             session_name = str(payload.get("name", _slugify_session_name(session_query))).strip() or _slugify_session_name(session_query)
             model = loaded_model if loaded_model in SUPPORTED_MODELS else model
             messages = loaded_messages
-            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
             _render_info(f"loaded session {session_name}")
             continue
         if user_input.startswith("/fork"):
@@ -1270,15 +1289,17 @@ def main() -> int:
             session_name = _slugify_session_name(fork_name) if fork_name else _default_session_name()
             model = loaded_model if loaded_model in SUPPORTED_MODELS else model
             messages = loaded_messages
-            _save_session(session_name, model=model, cwd=cwd, messages=messages)
-            _render_info(f"forked session into {session_name}")
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"forked session into {session_name} (not saved yet)")
             continue
         if user_input.startswith("/new"):
             _, _, raw_name = user_input.partition(" ")
             session_name = _slugify_session_name(raw_name) if raw_name.strip() else _default_session_name()
             messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
-            _save_session(session_name, model=model, cwd=cwd, messages=messages)
-            _render_info(f"started new session {session_name}")
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"started new session {session_name} (not saved yet)")
             continue
         if user_input.startswith("/delete"):
             _, _, raw_name = user_input.partition(" ")
@@ -1293,15 +1314,17 @@ def main() -> int:
                 if resolved_name == session_name:
                     session_name = _default_session_name()
                     messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
-                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                    _render_info(f"started new session {session_name}")
+                    if autosave:
+                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    _render_info(f"started new session {session_name} (not saved yet)")
             else:
                 _render_info(f"session not found: {resolved_name}")
             continue
         if user_input == "/model":
             model = _prompt_model(model)
             messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
-            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
             _render_info(f"model switched to {model}")
             continue
         if user_input == "/key":
@@ -1326,7 +1349,8 @@ def main() -> int:
 
         messages.append({"role": "user", "content": user_input})
         messages = _trim_history(messages)
-        _save_session(session_name, model=model, cwd=cwd, messages=messages)
+        if autosave:
+            _save_session(session_name, model=model, cwd=cwd, messages=messages)
 
         while True:
             try:
@@ -1363,13 +1387,15 @@ def main() -> int:
                             _render_info("attempting to continue after upstream error")
                             messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
                             messages = _trim_history(messages)
-                            _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                            if autosave:
+                                _save_session(session_name, model=model, cwd=cwd, messages=messages)
                             continue
                         break
 
                     assistant_text = response["text"].strip()
                     messages.append({"role": "assistant", "content": assistant_text})
-                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    if autosave:
+                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
                     action = _extract_json_object(assistant_text)
                     reasoning_text = _extract_reasoning_for_display(response, assistant_text, action)
                     _render_reasoning(reasoning_text)
@@ -1377,7 +1403,8 @@ def main() -> int:
                     if not action:
                         messages.append({"role": "user", "content": _repair_instruction(assistant_text)})
                         messages = _trim_history(messages)
-                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                        if autosave:
+                            _save_session(session_name, model=model, cwd=cwd, messages=messages)
                         continue
 
                     action_type = action.get("type")
@@ -1448,7 +1475,8 @@ def main() -> int:
                             tool_result = "\n\n".join(rendered_chunks)
                         messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                         messages = _trim_history(messages)
-                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                        if autosave:
+                            _save_session(session_name, model=model, cwd=cwd, messages=messages)
                         continue
 
                     if action_type != "run":
@@ -1494,14 +1522,16 @@ def main() -> int:
 
                     messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                     messages = _trim_history(messages)
-                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    if autosave:
+                        _save_session(session_name, model=model, cwd=cwd, messages=messages)
                 break
             except Exception as exc:
                 _render_step("Runtime Error")
                 _render_error_snippet("runtime error", str(exc))
                 messages.append({"role": "user", "content": _runtime_error_message(str(exc))})
                 messages = _trim_history(messages)
-                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                if autosave:
+                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
                 _render_info("attempting to continue after runtime error")
                 continue
 

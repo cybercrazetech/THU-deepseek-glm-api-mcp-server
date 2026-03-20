@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\Users\\USER\\Downloads\\THU-deepseek-glm-api-mcp-server\\agent.py'],
+    ['/mnt/c/Users/USER/Downloads/THU-deepseek-glm-api-mcp-server/agent.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -25,7 +25,7 @@ exe = EXE(
     name='thu-agent',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=True,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
