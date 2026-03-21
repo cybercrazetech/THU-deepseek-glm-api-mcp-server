@@ -445,7 +445,7 @@ def _perform_update(runtime: dict[str, str]) -> tuple[bool, str, bool]:
             return False, f"linux build failed:\n{_safe_completed_output(build_result)}", False
         source_bin = temp_root / "dist" / "thu-agent"
         target_bin = _linux_update_target()
-        install_result = _run_update_command(["install", "-m", "755", str(source_bin), str(target_bin)])
+        install_result = _run_update_command(["sudo", "install", "-m", "755", str(source_bin), str(target_bin)])
         if install_result.returncode != 0:
             return False, f"install failed for {target_bin}:\n{_safe_completed_output(install_result)}", False
         return True, f"updated executable at {target_bin}", False

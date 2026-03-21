@@ -9,7 +9,6 @@ $SpecPath = Join-Path $RootDir "thu-agent.spec"
 py -3 -m PyInstaller `
   --clean `
   --onefile `
-  --optimize 2 `
   --name thu-agent `
   --distpath $DistDir `
   --workpath $BuildDir `

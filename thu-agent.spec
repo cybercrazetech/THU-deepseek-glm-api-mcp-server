@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['/mnt/c/Users/USER/Downloads/THU-deepseek-glm-api-mcp-server/agent.py'],
+    ['C:\\Users\\USER\\Downloads\\THU-deepseek-glm-api-mcp-server\\agent.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -12,7 +12,7 @@ a = Analysis(
     runtime_hooks=[],
     excludes=['IPython', 'PIL', 'PyQt5', 'PyQt6', 'matplotlib', 'numpy', 'pygame', 'pytest', 'tkinter', 'traitlets', 'jedi', 'parso', 'gi', 'cryptography', 'bcrypt'],
     noarchive=False,
-    optimize=2,
+    optimize=0,
 )
 pyz = PYZ(a.pure)
 
@@ -21,11 +21,11 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    [('O', None, 'OPTION'), ('O', None, 'OPTION')],
+    [],
     name='thu-agent',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
