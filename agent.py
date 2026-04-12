@@ -70,7 +70,7 @@ MAX_MEMORY_FILE_CHARS = 3000
 MAX_ATTACHED_TEXT_CHARS = 20000
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_API_ERROR_RECOVERY = 2
-DISPLAY_FOLD_WIDTH = 96
+DEFAULT_FOLD_WIDTH = 80
 RESPONSE_INDENT = 2
 PANEL_INDENT = 3
 
@@ -214,8 +214,23 @@ def _touch_render_budget(estimated_chars: int) -> None:
     rendered_char_count += estimated_chars
 
 
-def _fold_long_display_text(value: str, width: int = DISPLAY_FOLD_WIDTH) -> str:
+def _display_fold_width() -> int:
+    env_width = os.getenv("THU_AGENT_FOLD_WIDTH")
+    width = None
+    if env_width and env_width.isdigit():
+        width = int(env_width)
+    if width is None:
+        try:
+            console_width = int(getattr(console, "width", 0) or 0)
+        except (TypeError, ValueError):
+            console_width = 0
+        width = console_width - 8 if console_width else DEFAULT_FOLD_WIDTH
+    return max(40, min(width, 120))
+
+
+def _fold_long_display_text(value: str, width: int | None = None) -> str:
     """Display-only folding for long tokens that Rich may otherwise crop."""
+    width = width or _display_fold_width()
     folded_lines: list[str] = []
     for line in str(value).splitlines() or [""]:
         if len(line) <= width:
@@ -1212,7 +1227,11 @@ def _render_step(title: str, subtitle: str = "") -> None:
 def _render_markdown(markdown_text: str) -> None:
     content = markdown_text.strip() or "_No response._"
     _touch_render_budget(len(content) + 200)
-    console.print(Padding(Markdown(_fold_long_display_text(content)), (0, 1, 0, RESPONSE_INDENT)), overflow="fold")
+    console.print(
+        Padding(Markdown(_fold_long_display_text(content)), (0, 1, 0, RESPONSE_INDENT)),
+        overflow="fold",
+        soft_wrap=True,
+    )
 
 
 def _render_snippet(title: str, code: str, language: str = "text") -> None:
