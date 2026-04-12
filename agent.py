@@ -1940,6 +1940,7 @@ def main() -> int:
         api_error_recovery_count = 0
         while True:
             try:
+                exit_to_prompt = False
                 while True:
                     _render_step("Thinking")
                     with console.status("[dim]thinking…[/dim]", spinner="dots"):
@@ -1997,6 +1998,7 @@ def main() -> int:
                             api_error_recovery_count += 1
                             if api_error_recovery_count > MAX_API_ERROR_RECOVERY:
                                 _render_info("stopped upstream-error recovery to avoid an infinite retry loop")
+                                exit_to_prompt = True
                                 break
                             _render_info("attempting to continue after upstream error")
                             messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
@@ -2035,6 +2037,7 @@ def main() -> int:
                                     code,
                                     str(snippet.get("language", "text")).strip() or "text",
                                 )
+                        exit_to_prompt = True
                         break
 
                     if action_type == "run_many":
@@ -2043,6 +2046,7 @@ def main() -> int:
                         batch_results_interrupted = False
                         if not command_items:
                             console.print("empty command batch request", style=ERROR)
+                            exit_to_prompt = True
                             break
                         _render_step(_action_summary("run_many", str(action.get("reason", "")).strip(), len(command_items)))
                         _render_command_batch(command_items, str(action.get("reason", "")).strip())
@@ -2109,6 +2113,7 @@ def main() -> int:
                             followup = _interrupt_followup_prompt()
                             if followup == "/stop":
                                 _render_info("stopped after interrupted command batch")
+                                exit_to_prompt = True
                                 break
                             if followup:
                                 messages.append(
@@ -2125,12 +2130,14 @@ def main() -> int:
                     if action_type != "run":
                         console.print("invalid tool response from model", style=ERROR)
                         _render_snippet("raw", assistant_text, "json")
+                        exit_to_prompt = True
                         break
 
                     command = str(action.get("command", "")).strip()
                     reason = str(action.get("reason", "")).strip()
                     if not command:
                         console.print("empty command request", style=ERROR)
+                        exit_to_prompt = True
                         break
 
                     _render_step(_action_summary("run", reason))
@@ -2185,8 +2192,11 @@ def main() -> int:
                             if autosave:
                                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
                     if stop_after_single_interrupt:
+                        exit_to_prompt = True
                         break
                     continue
+                if exit_to_prompt:
+                    break
             except Exception as exc:
                 _render_step("Runtime Error")
                 _render_error_snippet("runtime error", str(exc))
