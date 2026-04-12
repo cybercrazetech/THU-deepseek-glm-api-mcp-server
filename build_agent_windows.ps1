@@ -5,6 +5,7 @@ $AgentPath = Join-Path $RootDir "agent.py"
 $DistDir = Join-Path $RootDir "dist"
 $BuildDir = Join-Path $RootDir "build"
 $SpecPath = Join-Path $RootDir "thu-agent.spec"
+$env:PYGAME_HIDE_SUPPORT_PROMPT = "1"
 
 py -3 -m PyInstaller `
   --clean `
@@ -28,6 +29,8 @@ py -3 -m PyInstaller `
   --exclude-module gi `
   --exclude-module cryptography `
   --exclude-module bcrypt `
+  --exclude-module cffi `
+  --exclude-module pycparser `
   $AgentPath
 
 Write-Host ""

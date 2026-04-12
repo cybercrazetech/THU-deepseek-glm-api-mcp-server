@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['IPython', 'PIL', 'PyQt5', 'PyQt6', 'matplotlib', 'numpy', 'pygame', 'pytest', 'tkinter', 'traitlets', 'jedi', 'parso', 'gi', 'cryptography', 'bcrypt'],
+    excludes=['IPython', 'PIL', 'PyQt5', 'PyQt6', 'matplotlib', 'numpy', 'pygame', 'pytest', 'tkinter', 'traitlets', 'jedi', 'parso', 'gi', 'cryptography', 'bcrypt', 'cffi', 'pycparser'],
     noarchive=False,
     optimize=0,
 )

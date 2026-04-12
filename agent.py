@@ -2,17 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 import getpass
 import json
+import mimetypes
 import os
 import platform
+import queue
+import random
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,11 +35,12 @@ from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 DEFAULT_BASE_URL = "https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1"
 DEFAULT_MODEL = "deepseek-v3.2"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.7.0"
 GITHUB_REPO_URL = "https://github.com/cybercrazetech/THU-deepseek-glm-api-mcp-server.git"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/cybercrazetech/THU-deepseek-glm-api-mcp-server/main/VERSION"
 SUPPORTED_MODELS = [
@@ -57,6 +65,12 @@ CONFIG_DIR_NAME = ".thu-cybercraze-agent"
 MAX_HISTORY = 24
 MAX_TOOL_OUTPUT_CHARS = 12000
 MAX_RENDERED_CHARS = 50000
+MAX_PROJECT_CONTEXT_CHARS = 9000
+MAX_MEMORY_FILE_CHARS = 3000
+MAX_ATTACHED_TEXT_CHARS = 20000
+MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+MAX_API_ERROR_RECOVERY = 2
+DISPLAY_FOLD_WIDTH = 96
 RESPONSE_INDENT = 2
 PANEL_INDENT = 3
 
@@ -70,6 +84,8 @@ console = Console(soft_wrap=True)
 prompt_session: PromptSession[str] | None = None
 rendered_char_count = 0
 startup_update_notice: str | None = None
+active_processes: set[subprocess.Popen[bytes]] = set()
+active_processes_lock = threading.Lock()
 
 
 def _slash_commands() -> list[str]:
@@ -77,6 +93,12 @@ def _slash_commands() -> list[str]:
         "/help",
         "/save",
         "/autosave",
+        "/context",
+        "/compact",
+        "/clear",
+        "/status",
+        "/attach",
+        "/stop",
         "/sessions",
         "/load",
         "/fork",
@@ -192,6 +214,28 @@ def _touch_render_budget(estimated_chars: int) -> None:
     rendered_char_count += estimated_chars
 
 
+def _fold_long_display_text(value: str, width: int = DISPLAY_FOLD_WIDTH) -> str:
+    """Display-only folding for long tokens that Rich may otherwise crop."""
+    folded_lines: list[str] = []
+    for line in str(value).splitlines() or [""]:
+        if len(line) <= width:
+            folded_lines.append(line)
+            continue
+        parts = re.split(r"(\s+)", line)
+        rebuilt: list[str] = []
+        for part in parts:
+            if len(part) <= width or part.isspace():
+                rebuilt.append(part)
+                continue
+            rebuilt.append("\n".join(part[index : index + width] for index in range(0, len(part), width)))
+        folded_lines.extend("".join(rebuilt).splitlines())
+    return "\n".join(folded_lines)
+
+
+def _display_text(value: str, *, style: str = "") -> Text:
+    return Text(_fold_long_display_text(value), style=style, overflow="fold", no_wrap=False)
+
+
 def _parse_env_file(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not env_path.exists():
@@ -254,7 +298,7 @@ def _session_path(name: str) -> Path:
 def _session_summary(messages: list[dict[str, str]], name: str) -> str:
     for message in messages:
         if message.get("role") == "user":
-            text = str(message.get("content", "")).strip().replace("\n", " ")
+            text = _message_content_text(message.get("content", "")).strip().replace("\n", " ")
             if text:
                 return text[:80]
     return _slugify_session_name(name)
@@ -326,6 +370,144 @@ def _delete_session(name: str) -> bool:
         return False
     session_path.unlink()
     return True
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif item.get("type") == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    url = str(image_url.get("url", ""))
+                    parts.append(f"[image: {url[:80]}...]")
+                else:
+                    parts.append("[image]")
+            elif item.get("type") == "image":
+                parts.append("[image]")
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def _run_context_command(args: list[str], cwd: str, timeout: float = 3.0) -> str:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def _find_memory_files(cwd: str) -> list[Path]:
+    names = {"AGENTS.md", "CLAUDE.md", ".thu-agent.md"}
+    start = Path(cwd).resolve()
+    candidates: list[Path] = []
+    for directory in [start, *start.parents]:
+        for name in names:
+            path = directory / name
+            if path.is_file() and path not in candidates:
+                candidates.append(path)
+        if (directory / ".git").exists():
+            break
+    return candidates
+
+
+def _read_memory_file(path: Path, cwd: str) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if not content:
+        return ""
+    if len(content) > MAX_MEMORY_FILE_CHARS:
+        content = content[:MAX_MEMORY_FILE_CHARS] + "\n...[truncated]..."
+    try:
+        label = str(path.relative_to(cwd))
+    except ValueError:
+        label = str(path)
+    return f"### {label}\n{content}"
+
+
+def _git_context(cwd: str) -> str:
+    inside = _run_context_command(["git", "rev-parse", "--is-inside-work-tree"], cwd)
+    if inside != "true":
+        return ""
+    branch = _run_context_command(["git", "branch", "--show-current"], cwd) or "(detached)"
+    status = _run_context_command(["git", "--no-optional-locks", "status", "--short"], cwd)
+    log = _run_context_command(["git", "--no-optional-locks", "log", "--oneline", "-n", "5"], cwd)
+    if len(status) > 2000:
+        status = status[:2000] + "\n...[truncated]..."
+    return "\n".join(
+        [
+            "### Git Snapshot",
+            f"Branch: {branch}",
+            "Status:",
+            status or "(clean)",
+            "Recent commits:",
+            log or "(none)",
+        ]
+    )
+
+
+def _project_context(cwd: str) -> str:
+    sections = [f"### Date\n{dt.date.today().isoformat()}"]
+    git_context = _git_context(cwd)
+    if git_context:
+        sections.append(git_context)
+    memory_sections = [
+        text
+        for text in (_read_memory_file(path, cwd) for path in _find_memory_files(cwd))
+        if text
+    ]
+    if memory_sections:
+        sections.append("## Project Memory\n" + "\n\n".join(memory_sections))
+    context = "\n\n".join(sections).strip()
+    if len(context) > MAX_PROJECT_CONTEXT_CHARS:
+        context = context[:MAX_PROJECT_CONTEXT_CHARS] + "\n...[truncated]..."
+    return context
+
+
+def _system_message(cwd: str, runtime: dict[str, str], project_context: str) -> dict[str, str]:
+    return {"role": "system", "content": _agent_system_prompt(cwd, runtime, project_context)}
+
+
+def _estimate_context_chars(messages: list[dict[str, str]]) -> int:
+    return sum(len(_message_content_text(message.get("content", ""))) for message in messages)
+
+
+def _compact_messages(messages: list[dict[str, str]], keep_recent: int = 10) -> list[dict[str, str]]:
+    if len(messages) <= keep_recent + 2:
+        return messages
+    system = messages[:1]
+    old = messages[1:-keep_recent]
+    recent = messages[-keep_recent:]
+    summary_lines: list[str] = []
+    for message in old:
+        role = message.get("role", "message")
+        content = _message_content_text(message.get("content", "")).strip().replace("\n", " ")
+        if not content:
+            continue
+        summary_lines.append(f"- {role}: {content[:220]}")
+        if len(summary_lines) >= 30:
+            summary_lines.append("- ...additional earlier messages omitted...")
+            break
+    summary = "Earlier conversation compacted locally. Preserve these facts when continuing:\n" + "\n".join(summary_lines)
+    return system + [{"role": "user", "content": summary}] + recent
 
 
 def _version_key(version: str) -> tuple[Any, ...]:
@@ -530,13 +712,51 @@ def _extract_api_error(payload: dict[str, Any]) -> tuple[int | None, str | None]
     return None, None
 
 
+def _parse_retry_after(headers: httpx.Headers | None) -> float | None:
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            retry_at = dt.datetime.strptime(raw, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            return None
+        return max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+    return max(0.0, seconds)
+
+
+def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
+    if retry_after is not None:
+        return min(60.0, retry_after)
+    base = min(20.0, 1.5 * (2**attempt))
+    return base + random.uniform(0.0, 0.5)
+
+
 def _should_retry(status_code: int | None, message: str | None) -> bool:
-    if status_code in {400, 408, 409, 425, 429, 500, 502, 503, 504}:
+    if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
         return True
     if not message:
         return False
     lowered = message.lower()
-    return "busy" in lowered or "timeout" in lowered or "繁忙" in message
+    transient_tokens = [
+        "busy",
+        "timeout",
+        "temporarily",
+        "temporary",
+        "connection",
+        "reset",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "try again",
+        "繁忙",
+        "超时",
+    ]
+    return any(token in lowered or token in message for token in transient_tokens)
 
 
 def _is_invalid_api_key(error_message: str, status_code: int | None) -> bool:
@@ -546,6 +766,22 @@ def _is_invalid_api_key(error_message: str, status_code: int | None) -> bool:
     return any(
         token in lowered
         for token in ["api key", "token", "unauthorized", "invalid", "expired", "鉴权", "无效", "过期", "not found"]
+    )
+
+
+def _is_context_overflow_error(error_message: str) -> bool:
+    lowered = error_message.lower()
+    return any(
+        token in lowered
+        for token in [
+            "context length",
+            "context window",
+            "maximum context",
+            "too many tokens",
+            "token limit",
+            "prompt too long",
+            "context_length_exceeded",
+        ]
     )
 
 
@@ -571,7 +807,9 @@ def _chat_completion(
         "max_tokens": max_tokens,
     }
     url = f"{normalized_base_url}/chat/completions"
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+    retries: list[dict[str, Any]] = []
+    http_timeout = httpx.Timeout(timeout, connect=10.0, read=timeout, write=30.0, pool=10.0)
+    with httpx.Client(timeout=http_timeout, follow_redirects=False) as client:
         for attempt in range(max_retries + 1):
             try:
                 response = client.post(url, headers=_headers(api_key), json=body)
@@ -579,6 +817,15 @@ def _chat_completion(
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
                 error_message = f"HTTP {status_code} from upstream"
+                parsed_status, parsed_error = (None, None)
+                try:
+                    parsed_payload = exc.response.json()
+                    parsed_status, parsed_error = _extract_api_error(parsed_payload)
+                except ValueError:
+                    parsed_payload = None
+                if parsed_error:
+                    error_message = parsed_error
+                    status_code = parsed_status or status_code
                 location = exc.response.headers.get("location")
                 if 300 <= status_code < 400:
                     if location:
@@ -587,8 +834,10 @@ def _chat_completion(
                         error_message = f"HTTP {status_code} redirect from upstream"
                 if status_code == 404:
                     error_message = f"HTTP 404 from upstream at {url}"
-                if attempt < max_retries and status_code in {400, 408, 409, 425, 429, 500, 502, 503, 504}:
-                    time.sleep(attempt + 1)
+                if attempt < max_retries and _should_retry(status_code, error_message):
+                    delay = _retry_delay(attempt, _parse_retry_after(exc.response.headers))
+                    retries.append({"attempt": attempt + 1, "delay": delay, "status": status_code, "error": error_message})
+                    time.sleep(delay)
                     continue
                 return {
                     "ok": False,
@@ -597,14 +846,18 @@ def _chat_completion(
                     "raw": {
                         "url": str(exc.request.url),
                         "location": location,
+                        "payload": parsed_payload,
                     },
                     "text": "",
                     "reasoning": "",
+                    "retries": retries,
                 }
             except httpx.RequestError as exc:
                 error_message = f"network error: {exc}"
                 if attempt < max_retries:
-                    time.sleep(attempt + 1)
+                    delay = _retry_delay(attempt)
+                    retries.append({"attempt": attempt + 1, "delay": delay, "status": None, "error": error_message})
+                    time.sleep(delay)
                     continue
                 return {
                     "ok": False,
@@ -613,6 +866,7 @@ def _chat_completion(
                     "raw": None,
                     "text": "",
                     "reasoning": "",
+                    "retries": retries,
                 }
 
             try:
@@ -625,12 +879,15 @@ def _chat_completion(
                     "raw": response.text,
                     "text": "",
                     "reasoning": "",
+                    "retries": retries,
                 }
 
             status_code, error_message = _extract_api_error(payload)
             if error_message:
                 if attempt < max_retries and _should_retry(status_code, error_message):
-                    time.sleep(attempt + 1)
+                    delay = _retry_delay(attempt, _parse_retry_after(response.headers))
+                    retries.append({"attempt": attempt + 1, "delay": delay, "status": status_code, "error": error_message})
+                    time.sleep(delay)
                     continue
                 return {
                     "ok": False,
@@ -639,17 +896,19 @@ def _chat_completion(
                     "raw": payload,
                     "text": "",
                     "reasoning": "",
+                    "retries": retries,
                 }
             return {
                 "ok": True,
                 "text": _extract_text(payload),
                 "reasoning": _extract_reasoning(payload),
                 "raw": payload,
+                "retries": retries,
             }
-    return {"ok": False, "error": "Request loop exited unexpectedly", "text": "", "reasoning": ""}
+    return {"ok": False, "error": "Request loop exited unexpectedly", "text": "", "reasoning": "", "retries": retries}
 
 
-def _agent_system_prompt(cwd: str, runtime: dict[str, str]) -> str:
+def _agent_system_prompt(cwd: str, runtime: dict[str, str], project_context: str = "") -> str:
     if runtime["shell"] == "powershell":
         shell_guidance = (
             "Use PowerShell-native commands and syntax.\n"
@@ -678,6 +937,7 @@ def _agent_system_prompt(cwd: str, runtime: dict[str, str]) -> str:
             "You help the user inspect files, write code, run tests, and explain results.\n",
             "You have one tool: running a shell command in the current working directory after the user approves it.\n",
             "Prefer rg for searching. Keep commands focused and non-destructive unless the user explicitly asks.\n",
+            "When the user attaches a file, rely on the provided inline content when present; otherwise inspect the referenced path with shell commands.\n",
             shell_guidance,
             "Do not use interactive editors or pagers such as nano, vim, vi, less, more, or man.\n",
             file_write_guidance,
@@ -693,7 +953,13 @@ def _agent_system_prompt(cwd: str, runtime: dict[str, str]) -> str:
             '{"type":"run_many","reasoning":["short step","short step"],"parallel":false,"commands":[{"command":"pwd","reason":"confirm current directory"},{"command":"rg --files","reason":"list files"}],"reason":"gather context in one batch"}\n',
             "Set parallel=true only when the commands are independent and safe to run concurrently.\n",
             "If a later command depends on an earlier command, use run_many with parallel=false.\n",
-            "Keep reasoning short. Render user-facing explanations in markdown.",
+            "Keep reasoning short. Render user-facing explanations in markdown.\n",
+            (
+                "\nProject context snapshot. Treat this as startup context; inspect files directly when freshness matters.\n"
+                f"{project_context}\n"
+                if project_context
+                else ""
+            ),
         ]
     )
 
@@ -727,6 +993,71 @@ def _trim_history(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     return head + tail
 
 
+def _chat_completion_interruptible(**kwargs: Any) -> dict[str, Any]:
+    results: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            results.put(_chat_completion(**kwargs))
+        except Exception as exc:
+            results.put({"ok": False, "error": f"runtime error during model request: {exc}", "status": None, "text": "", "reasoning": ""})
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    while True:
+        try:
+            return results.get(timeout=0.15)
+        except queue.Empty:
+            continue
+        except KeyboardInterrupt:
+            return {"ok": False, "cancelled": True, "error": "model request interrupted by user", "status": None, "text": "", "reasoning": ""}
+
+
+def _register_process(process: subprocess.Popen[bytes]) -> None:
+    with active_processes_lock:
+        active_processes.add(process)
+
+
+def _unregister_process(process: subprocess.Popen[bytes]) -> None:
+    with active_processes_lock:
+        active_processes.discard(process)
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    runtime = _detect_runtime()
+    try:
+        if runtime["system"] == "Windows":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                process.wait(timeout=3)
+                return
+            except Exception:
+                process.terminate()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                process.terminate()
+        process.wait(timeout=3)
+    except Exception:
+        try:
+            if runtime["system"] != "Windows":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except Exception:
+            pass
+
+
+def _terminate_active_processes() -> None:
+    with active_processes_lock:
+        processes = list(active_processes)
+    for process in processes:
+        _terminate_process(process)
+
+
 def _run_command(command: str, cwd: str) -> dict[str, Any]:
     interactive_patterns = [
         r"(^|\s)nano(\s|$)",
@@ -752,6 +1083,11 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             cmd = ["powershell", "-NoProfile", "-Command", command]
         else:
             cmd = ["/bin/bash", "-lc", command]
+        popen_kwargs: dict[str, Any] = {}
+        if runtime["system"] == "Windows":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
         def _decode_output(data: bytes | None) -> str:
             if not data:
                 return ""
@@ -761,20 +1097,33 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **popen_kwargs,
         )
+        _register_process(process)
         try:
-            stdout, stderr = process.communicate(timeout=120)
-        except KeyboardInterrupt:
-            process.terminate()
             try:
-                stdout, stderr = process.communicate(timeout=5)
+                stdout, stderr = process.communicate(timeout=120)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _terminate_process(process)
                 stdout, stderr = process.communicate()
+                output = _decode_output(stdout) + _decode_output(stderr)
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
+                return {
+                    "exit_code": 124,
+                    "output": (output.strip() + "\nCommand timed out after 120 seconds.").strip(),
+                    "interrupted": False,
+                    "terminated": True,
+                }
+        except KeyboardInterrupt:
+            _terminate_process(process)
+            stdout, stderr = process.communicate()
             output = (_decode_output(stdout) + _decode_output(stderr)).strip()
             if len(output) > MAX_TOOL_OUTPUT_CHARS:
                 output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
             return {"exit_code": 130, "output": (output + "\nInterrupted by user.").strip(), "interrupted": True}
+        finally:
+            _unregister_process(process)
         output = _decode_output(stdout) + _decode_output(stderr)
         if len(output) > MAX_TOOL_OUTPUT_CHARS:
             output = output[:MAX_TOOL_OUTPUT_CHARS] + "\n...[truncated]..."
@@ -790,13 +1139,6 @@ def _run_command(command: str, cwd: str) -> dict[str, Any]:
             "output": normalized_output,
             "interrupted": False,
             "terminated": terminated,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "exit_code": 124,
-            "output": "Command timed out after 120 seconds.",
-            "interrupted": False,
-            "terminated": False,
         }
     except FileNotFoundError as exc:
         return {
@@ -843,7 +1185,7 @@ def _render_reasoning(reasoning_text: str) -> None:
     if not normalized:
         return
     _touch_render_budget(len(normalized) + 200)
-    text = Text(normalized, style=f"italic dim {MUTED}")
+    text = _display_text(normalized, style=f"italic dim {MUTED}")
     console.print(
         Padding(
             Panel(
@@ -860,7 +1202,7 @@ def _render_reasoning(reasoning_text: str) -> None:
 
 def _render_step(title: str, subtitle: str = "") -> None:
     _touch_render_budget(len(title) + len(subtitle) + 40)
-    text = Text(title, style=f"bold {ACCENT}")
+    text = _display_text(title, style=f"bold {ACCENT}")
     if subtitle:
         text.append("  ", style=DIM)
         text.append(subtitle, style=f"italic {DIM}")
@@ -870,7 +1212,7 @@ def _render_step(title: str, subtitle: str = "") -> None:
 def _render_markdown(markdown_text: str) -> None:
     content = markdown_text.strip() or "_No response._"
     _touch_render_budget(len(content) + 200)
-    console.print(Padding(Markdown(content), (0, 1, 0, RESPONSE_INDENT)))
+    console.print(Padding(Markdown(_fold_long_display_text(content)), (0, 1, 0, RESPONSE_INDENT)), overflow="fold")
 
 
 def _render_snippet(title: str, code: str, language: str = "text") -> None:
@@ -888,7 +1230,7 @@ def _render_command_request(command: str, reason: str) -> None:
     _touch_render_budget(len(command) + len(reason) + 200)
     group_items: list[Any] = [Syntax(command, "bash", theme="monokai", word_wrap=True)]
     if reason:
-        group_items.append(Text(reason, style=f"italic dim {MUTED}"))
+        group_items.append(_display_text(reason, style=f"italic dim {MUTED}"))
     console.print(
         Padding(
             Panel(Group(*group_items), border_style=DIM, title=" command ", padding=(0, 1), style="dim"),
@@ -901,11 +1243,11 @@ def _render_command_batch(command_items: list[dict[str, str]], reason: str) -> N
     _touch_render_budget(sum(len(item["command"]) + len(item["reason"]) for item in command_items) + len(reason) + 300)
     blocks: list[Any] = []
     if reason:
-        blocks.append(Text(reason, style=f"italic dim {MUTED}"))
+        blocks.append(_display_text(reason, style=f"italic dim {MUTED}"))
     for item in command_items:
         blocks.append(Syntax(item["command"], "bash", theme="monokai", word_wrap=True))
         if item["reason"]:
-            blocks.append(Text(item["reason"], style=f"italic dim {MUTED}"))
+            blocks.append(_display_text(item["reason"], style=f"italic dim {MUTED}"))
     console.print(
         Padding(
             Panel(Group(*blocks), border_style=DIM, title=" parallel commands ", padding=(0, 1), style="dim"),
@@ -959,7 +1301,7 @@ def _run_commands_sequential(command_items: list[dict[str, str]], cwd: str) -> l
 
 def _render_info(text: str) -> None:
     _touch_render_budget(len(text) + 40)
-    console.print(Padding(Text(text, style=f"dim {MUTED}"), (0, 0, 0, RESPONSE_INDENT)))
+    console.print(Padding(_display_text(text, style=f"dim {MUTED}"), (0, 0, 0, RESPONSE_INDENT)), overflow="fold")
 
 
 def _render_error_snippet(title: str, error_text: str) -> None:
@@ -1026,6 +1368,12 @@ def _print_help() -> None:
                             "- `/help` show this help",
                             "- `/save [name]` save the current in-memory session",
                             "- `/autosave` toggle automatic saving for the current session",
+                            "- `/context` show and refresh project context",
+                            "- `/compact [keep]` compact old conversation messages",
+                            "- `/clear` clear the in-memory conversation",
+                            "- `/status` show session/runtime status",
+                            "- `/attach <path> [instruction]` attach a local file to the next model turn",
+                            "- `/stop` no-op at the prompt; during an interrupt prompt it discards the interrupted turn",
                             "- `/sessions` list saved sessions",
                             "- `/load <id|name>` load a saved session",
                             "- `/fork <id|name> [new-name]` copy a saved session into a new current session",
@@ -1048,6 +1396,35 @@ def _print_help() -> None:
     )
 
 
+def _render_sessions_table(sessions: list[dict[str, Any]]) -> None:
+    table = Table(
+        show_header=True,
+        header_style=f"bold {ACCENT}",
+        expand=True,
+        border_style=DIM,
+        padding=(0, 1),
+    )
+    table.add_column("ID", justify="right", no_wrap=True, ratio=1)
+    table.add_column("Session", overflow="fold", no_wrap=False, ratio=3)
+    table.add_column("Last Used", overflow="fold", no_wrap=False, ratio=4)
+    table.add_column("Model", overflow="fold", no_wrap=False, ratio=3)
+    table.add_column("Summary", overflow="fold", no_wrap=False, ratio=7)
+    for idx, session in enumerate(sessions, start=1):
+        table.add_row(
+            str(idx),
+            _fold_long_display_text(str(session["name"])),
+            _fold_long_display_text(str(session["last_used_at"] or "-")),
+            _fold_long_display_text(str(session["model"] or "-")),
+            _fold_long_display_text(str(session["summary"] or "-")),
+        )
+    estimated = sum(
+        len(str(session["name"])) + len(str(session["last_used_at"])) + len(str(session["model"])) + len(str(session["summary"]))
+        for session in sessions
+    )
+    _touch_render_budget(estimated + 500)
+    console.print(Padding(table, (0, 1, 0, RESPONSE_INDENT)), overflow="fold")
+
+
 def _run_commands_parallel(command_items: list[dict[str, str]], cwd: str) -> list[dict[str, Any]]:
     indexed = list(enumerate(command_items))
     results: list[dict[str, Any]] = []
@@ -1056,31 +1433,55 @@ def _run_commands_parallel(command_items: list[dict[str, str]], cwd: str) -> lis
             executor.submit(_run_command, item["command"], cwd): (index, item)
             for index, item in indexed
         }
-        for future in concurrent.futures.as_completed(future_map):
-            index, item = future_map[future]
-            result = future.result()
-            results.append(
-                {
-                    "index": index,
-                    "command": item["command"],
-                    "reason": item["reason"],
-                    "exit_code": result["exit_code"],
-                    "output": result["output"],
-                    "terminated": result.get("terminated", False),
-                }
-            )
+        try:
+            for future in concurrent.futures.as_completed(future_map):
+                index, item = future_map[future]
+                result = future.result()
+                results.append(
+                    {
+                        "index": index,
+                        "command": item["command"],
+                        "reason": item["reason"],
+                        "exit_code": result["exit_code"],
+                        "output": result["output"],
+                        "interrupted": result.get("interrupted", False),
+                        "terminated": result.get("terminated", False),
+                    }
+                )
+        except KeyboardInterrupt:
+            _terminate_active_processes()
+            for future in future_map:
+                future.cancel()
+            for index, item in indexed:
+                if not any(result["index"] == index for result in results):
+                    results.append(
+                        {
+                            "index": index,
+                            "command": item["command"],
+                            "reason": item["reason"],
+                            "exit_code": 130,
+                            "output": "Interrupted by user.",
+                            "interrupted": True,
+                            "terminated": False,
+                        }
+                    )
+            return sorted(results, key=lambda item: item["index"])
     return sorted(results, key=lambda item: item["index"])
 
 
 def _print_banner(model: str, cwd: str, runtime: dict[str, str]) -> None:
+    command_text = (
+        "commands  /help  /save  /autosave  /context  /compact  /clear  /status  /attach  /stop  "
+        "/sessions  /load  /fork  /new  /delete  /update  /model  /key  /pwd  /alwaysRun  /exit"
+    )
     header = Group(
-        Text("THU CyberCraze Agent", style=f"bold {ACCENT}"),
-        Text("interactive coding session", style=f"italic {DIM}"),
-        Text(f"version {APP_VERSION}", style=MUTED),
-        Text(f"model  {model}", style=MUTED),
-        Text(f"cwd    {cwd}", style=MUTED),
-        Text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
-        Text("commands  /help  /save  /autosave  /sessions  /load  /fork  /new  /delete  /update  /model  /key  /pwd  /alwaysRun  /exit", style=DIM),
+        _display_text("THU CyberCraze Agent", style=f"bold {ACCENT}"),
+        _display_text("interactive coding session", style=f"italic {DIM}"),
+        _display_text(f"version {APP_VERSION}", style=MUTED),
+        _display_text(f"model  {model}", style=MUTED),
+        _display_text(f"cwd    {cwd}", style=MUTED),
+        _display_text(f"os     {runtime['system']} {runtime['release']}  via {runtime['shell_label']}", style=MUTED),
+        _display_text(command_text, style=DIM),
     )
     console.print()
     console.print(Padding(Panel(header, border_style=ACCENT, padding=(0, 2), title=" session "), (0, 0, 1, RESPONSE_INDENT)))
@@ -1133,6 +1534,115 @@ def _runtime_error_message(error_text: str) -> str:
     )
 
 
+def _is_text_attachment(path: Path, mime_type: str | None) -> bool:
+    if mime_type and mime_type.startswith("text/"):
+        return True
+    return path.suffix.lower() in {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".csv",
+        ".log",
+        ".sh",
+        ".ps1",
+        ".bat",
+        ".html",
+        ".css",
+        ".xml",
+        ".sql",
+        ".rs",
+        ".go",
+        ".java",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+    }
+
+
+def _build_attachment_user_message(path_text: str, cwd: str, prompt_text: str = "") -> dict[str, Any]:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    path = path.resolve()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"attachment not found: {path}")
+    size = path.stat().st_size
+    if size > MAX_ATTACHMENT_BYTES:
+        return {
+            "role": "user",
+            "content": (
+                f"Attached file reference: {path}\n"
+                f"Size: {size} bytes, larger than inline limit {MAX_ATTACHMENT_BYTES} bytes.\n"
+                "Inspect it with shell commands before relying on its content."
+                + (f"\nUser instruction: {prompt_text}" if prompt_text else "")
+            ),
+        }
+    mime_type, _ = mimetypes.guess_type(str(path))
+    if _is_text_attachment(path, mime_type):
+        content = path.read_text(encoding="utf-8", errors="replace")
+        truncated = ""
+        if len(content) > MAX_ATTACHED_TEXT_CHARS:
+            content = content[:MAX_ATTACHED_TEXT_CHARS]
+            truncated = "\n...[truncated]..."
+        return {
+            "role": "user",
+            "content": (
+                f"Attached text file: {path}\n"
+                f"MIME type: {mime_type or 'text/plain'}\n"
+                f"Size: {size} bytes\n"
+                + (f"User instruction: {prompt_text}\n" if prompt_text else "")
+                + "Content:\n"
+                f"```\n{content}{truncated}\n```"
+            ),
+        }
+    if mime_type and mime_type.startswith("image/") and os.environ.get("THU_AGENT_MULTIMODAL") == "1":
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Attached image: {path}\n"
+                        f"MIME type: {mime_type}\n"
+                        f"Size: {size} bytes\n"
+                        + (f"User instruction: {prompt_text}" if prompt_text else "Describe or inspect this image as relevant.")
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+            ],
+        }
+    return {
+        "role": "user",
+        "content": (
+            f"Attached file reference: {path}\n"
+            f"MIME type: {mime_type or 'unknown'}\n"
+            f"Size: {size} bytes\n"
+            "The file was not inlined. Use shell commands to inspect it if needed."
+            + (f"\nUser instruction: {prompt_text}" if prompt_text else "")
+        ),
+    }
+
+
+def _interrupt_followup_prompt() -> str:
+    try:
+        return _prompt("Interrupted. Enter follow-up, /stop to discard, or blank to return: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return "/stop"
+
+
 def main() -> int:
     global prompt_session, startup_update_notice
     parser = argparse.ArgumentParser(description="Interactive THU lab proxy terminal agent")
@@ -1177,7 +1687,8 @@ def main() -> int:
     autosave = False
 
     session_name = _default_session_name()
-    messages: list[dict[str, str]] = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+    project_context = _project_context(cwd)
+    messages: list[dict[str, str]] = [_system_message(cwd, runtime, project_context)]
     startup_update_notice = _check_for_update_notice()
     _print_banner(model, cwd, runtime)
     if startup_update_notice:
@@ -1211,6 +1722,79 @@ def main() -> int:
             if autosave:
                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
             continue
+        if user_input == "/context":
+            project_context = _project_context(cwd)
+            messages[0] = _system_message(cwd, runtime, project_context)
+            _render_markdown("## Project Context\n\n" + (project_context or "_No project context found._"))
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            continue
+        if user_input.startswith("/compact"):
+            _, _, raw_keep = user_input.partition(" ")
+            keep_recent = 10
+            if raw_keep.strip().isdigit():
+                keep_recent = max(4, min(30, int(raw_keep.strip())))
+            before_count = len(messages)
+            before_chars = _estimate_context_chars(messages)
+            messages = _compact_messages(messages, keep_recent=keep_recent)
+            after_chars = _estimate_context_chars(messages)
+            _render_info(
+                f"compacted {before_count} -> {len(messages)} messages; context chars {before_chars} -> {after_chars}"
+            )
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            continue
+        if user_input == "/clear":
+            messages = [_system_message(cwd, runtime, project_context)]
+            _render_info("cleared in-memory conversation")
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            continue
+        if user_input == "/status":
+            status_lines = [
+                "## Status",
+                f"- Version: `{APP_VERSION}`",
+                f"- Model: `{model}`",
+                f"- Session: `{session_name}`",
+                f"- Autosave: `{'on' if autosave else 'off'}`",
+                f"- AlwaysRun: `{'on' if always_run else 'off'}`",
+                f"- Multimodal attachments: `{'on' if os.environ.get('THU_AGENT_MULTIMODAL') == '1' else 'off'}`",
+                f"- Messages: `{len(messages)}`",
+                f"- Context chars: `{_estimate_context_chars(messages)}`",
+                f"- CWD: `{cwd}`",
+                f"- Memory files: `{len(_find_memory_files(cwd))}`",
+            ]
+            _render_markdown("\n".join(status_lines))
+            continue
+        if user_input.startswith("/attach"):
+            _, _, raw_args = user_input.partition(" ")
+            raw_args = raw_args.strip()
+            if not raw_args:
+                raw_args = _prompt("File path: ").strip()
+            if not raw_args:
+                _render_info("attachment path is required")
+                continue
+            try:
+                attach_parts = shlex.split(raw_args, posix=platform.system() != "Windows")
+            except ValueError as exc:
+                _render_error_snippet("attachment error", str(exc))
+                continue
+            path_part = attach_parts[0] if attach_parts else ""
+            prompt_part = " ".join(attach_parts[1:])
+            try:
+                attachment_message = _build_attachment_user_message(path_part, cwd, prompt_part.strip())
+            except OSError as exc:
+                _render_error_snippet("attachment error", str(exc))
+                continue
+            messages.append(attachment_message)
+            messages = _trim_history(messages)
+            if autosave:
+                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+            _render_info(f"attached {Path(path_part).name}; send a prompt or let the model inspect it next")
+            continue
+        if user_input == "/stop":
+            _render_info("no active task at the prompt; press Ctrl+C while the agent is thinking or running a command to interrupt it")
+            continue
         if user_input == "/update":
             latest_version = _fetch_latest_version()
             if latest_version and _version_key(latest_version) <= _version_key(APP_VERSION):
@@ -1235,13 +1819,7 @@ def main() -> int:
             if not sessions:
                 _render_info("no saved sessions")
             else:
-                lines = ["| ID | Session | Last Used | Model | Summary |", "| --- | --- | --- | --- | --- |"]
-                for idx, session in enumerate(sessions, start=1):
-                    lines.append(
-                        f"| {idx} | `{session['name']}` | {session['last_used_at'] or '-'} | "
-                        f"{session['model'] or '-'} | {session['summary']} |"
-                    )
-                _render_markdown("\n".join(lines))
+                _render_sessions_table(sessions)
             continue
         if user_input.startswith("/load"):
             _, _, raw_name = user_input.partition(" ")
@@ -1291,15 +1869,16 @@ def main() -> int:
             messages = loaded_messages
             if autosave:
                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
-            _render_info(f"forked session into {session_name} (not saved yet)")
+            _render_info(f"forked session into {session_name}" + ("" if autosave else " (not saved yet)"))
             continue
         if user_input.startswith("/new"):
             _, _, raw_name = user_input.partition(" ")
             session_name = _slugify_session_name(raw_name) if raw_name.strip() else _default_session_name()
-            messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+            project_context = _project_context(cwd)
+            messages = [_system_message(cwd, runtime, project_context)]
             if autosave:
                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
-            _render_info(f"started new session {session_name} (not saved yet)")
+            _render_info(f"started new session {session_name}" + ("" if autosave else " (not saved yet)"))
             continue
         if user_input.startswith("/delete"):
             _, _, raw_name = user_input.partition(" ")
@@ -1307,22 +1886,28 @@ def main() -> int:
             if not session_query:
                 _render_info("session name is required")
                 continue
-            resolved_name = _resolve_session_reference(session_query)
+            try:
+                resolved_name = _resolve_session_reference(session_query)
+            except FileNotFoundError as exc:
+                _render_info(str(exc))
+                continue
             deleted = _delete_session(resolved_name)
             if deleted:
                 _render_info(f"deleted session {resolved_name}")
                 if resolved_name == session_name:
                     session_name = _default_session_name()
-                    messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+                    project_context = _project_context(cwd)
+                    messages = [_system_message(cwd, runtime, project_context)]
                     if autosave:
                         _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                    _render_info(f"started new session {session_name} (not saved yet)")
+                    _render_info(f"started new session {session_name}" + ("" if autosave else " (not saved yet)"))
             else:
                 _render_info(f"session not found: {resolved_name}")
             continue
         if user_input == "/model":
             model = _prompt_model(model)
-            messages = [{"role": "system", "content": _agent_system_prompt(cwd, runtime)}]
+            project_context = _project_context(cwd)
+            messages = [_system_message(cwd, runtime, project_context)]
             if autosave:
                 _save_session(session_name, model=model, cwd=cwd, messages=messages)
             _render_info(f"model switched to {model}")
@@ -1352,27 +1937,44 @@ def main() -> int:
         if autosave:
             _save_session(session_name, model=model, cwd=cwd, messages=messages)
 
+        api_error_recovery_count = 0
         while True:
             try:
                 while True:
                     _render_step("Thinking")
-                    try:
-                        with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                            response = _chat_completion(
-                                api_key=api_key,
-                                model=model,
-                                messages=messages,
-                                base_url=base_url,
-                            )
-                    except KeyboardInterrupt:
+                    with console.status("[dim]thinking…[/dim]", spinner="dots"):
+                        response = _chat_completion_interruptible(
+                            api_key=api_key,
+                            model=model,
+                            messages=messages,
+                            base_url=base_url,
+                        )
+                    if response.get("cancelled"):
                         _render_step("Cancelled")
                         _render_info("interrupted current model request")
-                        if messages and messages[-1].get("role") == "user":
+                        followup = _interrupt_followup_prompt()
+                        if followup == "/stop" and messages and messages[-1].get("role") == "user":
                             messages.pop()
+                            _render_info("discarded interrupted user turn")
+                            break
+                        if followup:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "The user interrupted the previous model request and added this follow-up instruction:\n" + followup,
+                                }
+                            )
+                            messages = _trim_history(messages)
+                            if autosave:
+                                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                            continue
                         break
                     if not response["ok"]:
                         _render_step("Upstream Error")
                         console.print(Padding(f"upstream error: {response['error']}", (0, 0, 0, RESPONSE_INDENT)), style=ERROR)
+                        retries = response.get("retries")
+                        if isinstance(retries, list) and retries:
+                            _render_info(f"retry attempts already made: {len(retries)}")
                         if response.get("status") == 404:
                             _render_info(f"active base URL: {base_url}")
                             _render_info("this 404 is coming from the upstream proxy, not from local command execution.")
@@ -1383,7 +1985,19 @@ def main() -> int:
                             _save_api_key_to_env(api_key)
                             _render_info(f"saved updated API key to {_global_env_path()}")
                             continue
+                        if _is_context_overflow_error(str(response["error"])):
+                            before_chars = _estimate_context_chars(messages)
+                            messages = _compact_messages(messages, keep_recent=8)
+                            after_chars = _estimate_context_chars(messages)
+                            _render_info(f"compacted context after upstream context error: {before_chars} -> {after_chars} chars")
+                            if autosave:
+                                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                            continue
                         if response.get("status") in {None, 400, 408, 409, 425, 429, 500, 502, 503, 504}:
+                            api_error_recovery_count += 1
+                            if api_error_recovery_count > MAX_API_ERROR_RECOVERY:
+                                _render_info("stopped upstream-error recovery to avoid an infinite retry loop")
+                                break
                             _render_info("attempting to continue after upstream error")
                             messages.append({"role": "user", "content": _runtime_error_message(str(response["error"]))})
                             messages = _trim_history(messages)
@@ -1392,6 +2006,7 @@ def main() -> int:
                             continue
                         break
 
+                    api_error_recovery_count = 0
                     assistant_text = response["text"].strip()
                     messages.append({"role": "assistant", "content": assistant_text})
                     if autosave:
@@ -1425,6 +2040,7 @@ def main() -> int:
                     if action_type == "run_many":
                         command_items = _normalize_command_batch(action)
                         run_parallel = _command_batch_parallel(action)
+                        batch_results_interrupted = False
                         if not command_items:
                             console.print("empty command batch request", style=ERROR)
                             break
@@ -1443,9 +2059,20 @@ def main() -> int:
                                     else:
                                         results = _run_commands_sequential(command_items, cwd)
                             except KeyboardInterrupt:
+                                _terminate_active_processes()
                                 _render_step("Cancelled")
                                 _render_info("interrupted command batch")
-                                break
+                                results = [
+                                    {
+                                        "index": 0,
+                                        "command": "(batch)",
+                                        "reason": "interrupted command batch",
+                                        "exit_code": 130,
+                                        "output": "Interrupted by user.",
+                                        "interrupted": True,
+                                        "terminated": False,
+                                    }
+                                ]
                             _render_step("Command Results")
                             rendered_chunks: list[str] = []
                             for result in results:
@@ -1471,12 +2098,28 @@ def main() -> int:
                                     _render_info("command batch stopped because a command terminated unexpectedly")
                                     break
                                 if result.get("interrupted"):
+                                    batch_results_interrupted = True
                                     break
                             tool_result = "\n\n".join(rendered_chunks)
                         messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                         messages = _trim_history(messages)
                         if autosave:
                             _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                        if batch_results_interrupted:
+                            followup = _interrupt_followup_prompt()
+                            if followup == "/stop":
+                                _render_info("stopped after interrupted command batch")
+                                break
+                            if followup:
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": "The user interrupted the previous command batch and added this follow-up instruction:\n" + followup,
+                                    }
+                                )
+                                messages = _trim_history(messages)
+                                if autosave:
+                                    _save_session(session_name, model=model, cwd=cwd, messages=messages)
                         continue
 
                     if action_type != "run":
@@ -1492,6 +2135,7 @@ def main() -> int:
 
                     _render_step(_action_summary("run", reason))
                     _render_command_request(command, reason)
+                    single_result_interrupted = False
                     if not _prompt_run_command(always_run):
                         tool_result = "Command was not approved by the user."
                         _render_info(tool_result)
@@ -1518,13 +2162,31 @@ def main() -> int:
                         if result.get("interrupted"):
                             _render_step("Cancelled")
                             _render_info("interrupted current command")
-                            break
+                            single_result_interrupted = True
 
                     messages.append({"role": "user", "content": _tool_result_message(tool_result)})
                     messages = _trim_history(messages)
                     if autosave:
                         _save_session(session_name, model=model, cwd=cwd, messages=messages)
-                break
+                    stop_after_single_interrupt = False
+                    if single_result_interrupted:
+                        followup = _interrupt_followup_prompt()
+                        if followup == "/stop":
+                            _render_info("stopped after interrupted command")
+                            stop_after_single_interrupt = True
+                        elif followup:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "The user interrupted the previous command and added this follow-up instruction:\n" + followup,
+                                }
+                            )
+                            messages = _trim_history(messages)
+                            if autosave:
+                                _save_session(session_name, model=model, cwd=cwd, messages=messages)
+                    if stop_after_single_interrupt:
+                        break
+                    continue
             except Exception as exc:
                 _render_step("Runtime Error")
                 _render_error_snippet("runtime error", str(exc))

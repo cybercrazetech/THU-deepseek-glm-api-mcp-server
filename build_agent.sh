@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYGAME_HIDE_SUPPORT_PROMPT=1
 
 python3 -m PyInstaller \
   --clean \
@@ -24,6 +25,8 @@ python3 -m PyInstaller \
   --exclude-module gi \
   --exclude-module cryptography \
   --exclude-module bcrypt \
+  --exclude-module cffi \
+  --exclude-module pycparser \
   "$ROOT_DIR/agent.py"
 
 echo

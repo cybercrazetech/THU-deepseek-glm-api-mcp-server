@@ -177,6 +177,14 @@ Current supported models:
 Slash commands available in the session:
 
 - `/help`
+- `/save [name]`
+- `/autosave`
+- `/context`
+- `/compact [keep]`
+- `/clear`
+- `/status`
+- `/attach <path> [instruction]`
+- `/stop`
 - `/sessions`
 - `/load <id|name>`
 - `/fork <id|name> [new-name]`
@@ -189,6 +197,22 @@ Slash commands available in the session:
 - `/alwaysRun`
 - `/exit`
 
+Sessions are manual-save by default. Use `/save` when you want to persist the current in-memory conversation, or `/autosave` to keep the current session file updated automatically.
+
+Project context:
+
+- `/context` refreshes and displays the startup context snapshot.
+- The context snapshot includes the current date, a lightweight git snapshot, and nearby memory files such as `AGENTS.md`, `CLAUDE.md`, and `.thu-agent.md`.
+- `/compact [keep]` locally summarizes older messages and keeps recent turns to reduce context size.
+- `/clear` clears the current in-memory conversation while preserving the current project context.
+- `/status` shows version, model, session name, autosave state, message count, and context size.
+
+Attachments:
+
+- `/attach path/to/file.txt explain this file` inlines small text/code files into the next model turn.
+- Non-text files are passed as file references so the agent can inspect them with shell commands.
+- Image files can be sent as multimodal image content only when the selected model/proxy supports it and `THU_AGENT_MULTIMODAL=1` is set. Otherwise they are treated as file references.
+
 At startup, the agent compares its embedded version with the GitHub `VERSION` file. If a newer release exists, it shows a short reminder to run `/update`.
 
 `/update` behavior:
@@ -196,7 +220,7 @@ At startup, the agent compares its embedded version with the GitHub `VERSION` fi
 - Linux: clones the GitHub repo to a temporary directory, rebuilds the binary, installs it to the current executable path or `/usr/local/bin/thu-agent`, and removes the temporary clone. If the install target needs elevated permissions, run the agent with appropriate privileges or update manually.
 - Windows: stages a post-exit replacement of the running `.exe` after rebuilding from a temporary clone, then exits so the replacement can complete.
 
-While the agent is thinking or running a command, press `Ctrl+C` to cancel the current operation and return to the prompt without exiting the whole session.
+While the agent is thinking or running a command, press `Ctrl+C` to interrupt the current operation. The agent then asks for a follow-up instruction. Type `/stop` there to discard/stop the interrupted turn, type a new instruction to continue from the interruption, or press Enter to return to the normal prompt.
 
 ## Typical Workflow
 
