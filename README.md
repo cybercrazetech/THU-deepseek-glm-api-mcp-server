@@ -1,98 +1,12 @@
-# NO RATE LIMIT FOR THU STUDENT!! THU Agent by CyberCraze
+# THU CyberCraze Agent
 
-Interactive terminal coding agent powered by the THU lab proxy OpenAI-compatible API.
+Interactive terminal coding agent powered by the THU lab proxy (OpenAI-compatible API). It runs in your current terminal, works in your current directory, can inspect files, propose shell commands, and wait for your approval before running them.
 
-The agent runs in your current terminal, works in your current directory, can inspect files, propose shell commands, and wait for your approval before running them.
+## 1. Installation
 
-## Platform Use
+### 1.1 Get an API key
 
-### Linux
-
-Use the built executable:
-
-```bash
-./dist/thu-agent
-```
-
-Linux executable path:
-
-```text
-dist/thu-agent
-```
-
-To run it globally, copy or symlink it into a directory on your `PATH`, for example:
-
-```bash
-sudo install -m 755 dist/thu-agent /usr/local/bin/thu-agent
-```
-
-Then run:
-
-```bash
-thu-agent
-```
-
-### Windows
-
-Use the Windows executable after building it on Windows:
-
-```powershell
-.\dist\thu-agent.exe
-```
-
-Windows executable path:
-
-```text
-dist\thu-agent.exe
-```
-
-To run it globally on Windows, add the repo `dist` directory to your `PATH`, or copy the executable into a directory already on `PATH`.
-
-Example PowerShell command to add the current repo `dist` directory for your user:
-
-```powershell
-[Environment]::SetEnvironmentVariable(
-  "Path",
-  $env:Path + ";C:\Users\USER\Downloads\THU-deepseek-glm-api-mcp-server\dist",
-  "User"
-)
-```
-
-Then open a new terminal and run:
-
-```powershell
-thu-agent.exe
-```
-
-Build it from Windows with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build_agent_windows.ps1
-```
-
-### macOS
-
-There is no packaged macOS binary in this repo.
-
-Run the Python entrypoint directly:
-
-```bash
-python3 agent.py
-```
-
-If you want a global command on macOS, create a small wrapper in `/usr/local/bin` or another directory on your `PATH`:
-
-```bash
-sudo ln -sf "/absolute/path/to/agent.py" /usr/local/bin/thu-agent.py
-```
-
-or run the repo-local command directly from a shell alias.
-
-## API Setup
-
-The agent uses the THU lab proxy.
-
-Create an API key first at:
+Create a key here:
 
 ```text
 https://lab.cs.tsinghua.edu.cn/ai-platform/c/new
@@ -104,50 +18,117 @@ Base URL:
 https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1
 ```
 
-Set your key with an environment variable:
+Set environment variables:
 
 ```bash
 export THU_LAB_PROXY_API_KEY='your_proxy_key_here'
 export THU_LAB_PROXY_BASE_URL='https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1'
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 $env:THU_LAB_PROXY_API_KEY='your_proxy_key_here'
 $env:THU_LAB_PROXY_BASE_URL='https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1'
 ```
 
-You can also launch the agent and paste the key when prompted. The agent saves it into a per-user global config file for reuse.
-
-Config location:
+You can also launch the agent and paste the key when prompted. The agent saves it into a per-user global config file:
 
 - Linux and macOS: `~/.thu-cybercraze-agent/.env`
 - Windows: `%USERPROFILE%\.thu-cybercraze-agent\.env`
 
-## Start the Agent
+### 1.2 Run the agent
 
-From the repo root:
+Linux (built binary):
 
 ```bash
 ./dist/thu-agent
 ```
 
-Or with Python:
+Windows (built on Windows):
+
+```powershell
+.\dist\thu-agent.exe
+```
+
+macOS (run Python directly):
 
 ```bash
 python3 agent.py
 ```
 
-You can also pass the model and key directly:
+### 1.3 Build the binaries (if needed)
+
+Linux build:
+
+```bash
+bash build_agent.sh
+```
+
+Result:
+
+```text
+dist/thu-agent
+```
+
+Windows build (run on Windows, not inside WSL):
+
+```powershell
+py -3 -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build_agent_windows.ps1
+```
+
+Result:
+
+```text
+dist\thu-agent.exe
+```
+
+### 1.4 Optional: Run globally
+
+Linux:
+
+```bash
+sudo install -m 755 dist/thu-agent /usr/local/bin/thu-agent
+```
+
+Windows: add the repo `dist` directory to `PATH`, or copy the `.exe` into a directory already on `PATH`.
+
+Example (PowerShell):
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  $env:Path + ";C:\Users\USER\Downloads\THU-deepseek-glm-api-mcp-server\dist",
+  "User"
+)
+```
+
+Open a new terminal and run:
+
+```powershell
+thu-agent.exe
+```
+
+## 2. Usage
+
+Start the agent:
+
+```bash
+./dist/thu-agent
+```
+
+Or run with Python:
+
+```bash
+python3 agent.py
+```
+
+Pass model and key directly if you want:
 
 ```bash
 python3 agent.py --model deepseek-v3.2 --api-key "$THU_LAB_PROXY_API_KEY"
 ```
-
-## Model Selection
-
-The startup picker shows the models currently wired into the agent.
 
 Default model:
 
@@ -155,7 +136,7 @@ Default model:
 deepseek-v3.2
 ```
 
-Current supported models:
+Current models:
 
 - `qwen3-max-thinking`
 - `qwen3-max`
@@ -172,9 +153,11 @@ Current supported models:
 - `deepseek-v3.2-thinking`
 - `deepseek-v3.2`
 
-## In-Agent Commands
+While the agent is thinking or running a command, press `Ctrl+C` to interrupt. It will ask for a follow-up instruction. Type `/stop` there to discard the interrupted turn, or type a new instruction to continue.
 
-Slash commands available in the session:
+## 3. Function List
+
+Slash commands available:
 
 - `/help`
 - `/save [name]`
@@ -197,118 +180,52 @@ Slash commands available in the session:
 - `/alwaysRun`
 - `/exit`
 
-Sessions are manual-save by default. Use `/save` when you want to persist the current in-memory conversation, or `/autosave` to keep the current session file updated automatically.
+## 4. Function Explanation
 
-Project context:
+Session and memory:
 
-- `/context` refreshes and displays the startup context snapshot.
-- The context snapshot includes the current date, a lightweight git snapshot, and nearby memory files such as `AGENTS.md`, `CLAUDE.md`, and `.thu-agent.md`.
-- `/compact [keep]` locally summarizes older messages and keeps recent turns to reduce context size.
-- `/clear` clears the current in-memory conversation while preserving the current project context.
+- `/save [name]` saves the current session to disk. Sessions are manual-save by default.
+- `/autosave` toggles automatic saving for this session.
+- `/sessions` lists saved sessions with an ID, summary, and last-used time.
+- `/load <id|name>` loads a saved session.
+- `/fork <id|name> [new-name]` creates a new session from a saved one.
+- `/new [name]` starts a new session with a fresh context.
+- `/delete <id|name>` deletes a saved session.
+
+Context management:
+
+- `/context` refreshes and displays the startup context snapshot (date, git status, nearby memory files like `AGENTS.md` or `CLAUDE.md`).
+- `/compact [keep]` summarizes older messages and keeps recent turns to reduce context size.
+- `/clear` clears in-memory conversation while preserving current project context.
 - `/status` shows version, model, session name, autosave state, message count, and context size.
+
+Commands and execution:
+
+- `/alwaysRun` toggles auto-approval for shell commands.
+- `/stop` is used only after an interrupt prompt to discard the interrupted turn.
 
 Attachments:
 
 - `/attach path/to/file.txt explain this file` inlines small text/code files into the next model turn.
-- Non-text files are passed as file references so the agent can inspect them with shell commands.
-- Image files can be sent as multimodal image content only when the selected model/proxy supports it and `THU_AGENT_MULTIMODAL=1` is set. Otherwise they are treated as file references.
+- Non-text files are passed as file references for the agent to inspect with commands.
+- Image files can be sent as multimodal content only when the selected model/proxy supports it and `THU_AGENT_MULTIMODAL=1` is set. Otherwise they are treated as file references.
 
-At startup, the agent compares its embedded version with the GitHub `VERSION` file. If a newer release exists, it shows a short reminder to run `/update`.
+Models and keys:
 
-`/update` behavior:
+- `/model` reselects the model (this resets the conversation context).
+- `/key` updates the API key and saves it to the global `.env`.
 
-- Linux: clones the GitHub repo to a temporary directory, rebuilds the binary, installs it to the current executable path or `/usr/local/bin/thu-agent`, and removes the temporary clone. If the install target needs elevated permissions, run the agent with appropriate privileges or update manually.
-- Windows: stages a post-exit replacement of the running `.exe` after rebuilding from a temporary clone, then exits so the replacement can complete.
+Updates:
 
-While the agent is thinking or running a command, press `Ctrl+C` to interrupt the current operation. The agent then asks for a follow-up instruction. Type `/stop` there to discard/stop the interrupted turn, type a new instruction to continue from the interruption, or press Enter to return to the normal prompt.
+- At startup, the agent compares its embedded version with the GitHub `VERSION` file and reminds you if it is behind.
+- `/update` clones the GitHub repo to a temp directory, rebuilds the binary, installs it to the current executable path (or `/usr/local/bin/thu-agent` on Linux), then removes the temp clone. On Windows it stages a post-exit replacement of the running `.exe`.
 
-## Typical Workflow
+Other:
 
-1. Start the agent.
-2. Choose a model or press Enter for the default.
-3. Reuse the saved API key or paste a new one.
-4. Type requests at the `>` prompt.
-5. Approve commands when the agent asks.
+- `/pwd` prints the current working directory.
+- `/help` shows the command list.
+- `/exit` quits the agent.
 
-Example prompts:
+Notes:
 
-- `list the files in this directory`
-- `write a hello world script in python`
-- `inspect this project and explain how to run it`
-- `create a small bash script that prints the current date`
-
-## Command Approval
-
-By default, the agent asks before running each command.
-
-To auto-approve commands for the current session:
-
-```text
-/alwaysRun
-```
-
-Use that carefully.
-
-## Build
-
-### Linux build
-
-```bash
-bash build_agent.sh
-```
-
-Result:
-
-```text
-dist/thu-agent
-```
-
-This build uses the current Python environment and PyInstaller, with extra excludes plus strip/optimize enabled to keep the binary smaller.
-
-### Windows build
-
-Run this on Windows, not inside WSL:
-
-```powershell
-py -3 -m pip install pyinstaller
-powershell -ExecutionPolicy Bypass -File .\build_agent_windows.ps1
-```
-
-Result:
-
-```text
-dist\thu-agent.exe
-```
-
-### macOS run path
-
-macOS users should run the Python entrypoint directly:
-
-```bash
-python3 agent.py
-```
-
-## Direct API Test
-
-You can test the proxy directly:
-
-```bash
-curl --location --request POST \
-  'https://lab.cs.tsinghua.edu.cn/ai-platform/api/v1/chat/completions' \
-  --header 'Content-Type: application/json' \
-  --header "authorization: Bearer $THU_LAB_PROXY_API_KEY" \
-  --data-raw '{
-    "model": "deepseek-v3.2",
-    "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
-    "temperature": 0.2,
-    "repetition_penalty": 1.1,
-    "stream": false
-  }'
-```
-
-## Notes
-
-- The Linux binary is already buildable from this repo.
-- The Windows `.exe` must be built from a Windows Python environment.
-- macOS users should run `agent.py` directly unless they package it themselves.
-- The MCP server code in `server.py` still uses the older backend and is separate from the interactive agent in `agent.py`.
+- The MCP server in `server.py` is separate from the interactive agent in `agent.py`.
